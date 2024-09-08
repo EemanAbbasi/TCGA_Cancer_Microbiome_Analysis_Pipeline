@@ -1,8 +1,6 @@
 ---
 title: "R Notebook"
-output: 
-  html_document:
-    keep_md: true
+output: html_notebook
 ---
  
 
@@ -3989,5 +3987,6 @@ co_occurrence_df_4_names <- co_occurrence_df_4$names
 
 
 ```
+
 
 
