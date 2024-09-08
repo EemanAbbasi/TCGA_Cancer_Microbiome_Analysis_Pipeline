@@ -1,0 +1,3990 @@
+---
+title: "Cancer TCGA analysis Thesis Chapter 2"
+output: html_notebook
+
+---
+ 
+
+```{r}
+# Load Libraries
+library('survminer')
+library("survival")
+library(ggplot2)
+library("readxl")
+library(data.table)
+library(gplots)
+library(dplyr)
+library(gridExtra)
+library(forcats)
+library('flexsurv')
+library(ciTools)
+library(lemon)
+library(dplyr)
+library(vegan)
+library(MicrobiotaProcess)
+library(patchwork)
+library(stringr)
+library(survival)
+library(survminer)
+library(gridExtra)
+library(compositions)
+library(phyloseq)
+library(ggplot2)
+library(ConQuR)
+library(doParallel) 
+library(compositions)
+library(DESeq2)
+library(DESeq2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggbeeswarm)
+
+```
+
+#Helper functions
+```{r}
+library(nlme)
+library(dplyr)
+library(ggplot2)
+library(compositions)
+
+# OTU table should be a matrix/data.frame with each feature in rows and sample in columns. 
+# Metadata should be a matrix/data.frame containing the sample identifier. 
+
+# Data Pre-Processing
+feature_table_pre_process = function(feature_table, meta_data, sample_var, group_var = NULL, 
+                                     out_cut = 0.05, zero_cut = 0.90, lib_cut, neg_lb){
+  feature_table = data.frame(feature_table, check.names = FALSE)
+  meta_data = data.frame(meta_data, check.names = FALSE)
+  # Drop unused levels
+  meta_data[] = lapply(meta_data, function(x) if(is.factor(x)) factor(x) else x)
+  # Match sample IDs between metadata and feature table
+  sample_ID = intersect(meta_data[, sample_var], colnames(feature_table))
+  feature_table = feature_table[, sample_ID]
+  meta_data = meta_data[match(sample_ID, meta_data[, sample_var]), ]
+  
+  # 1. Identify outliers within each taxon
+  if (!is.null(group_var)) {
+    group = meta_data[, group_var]
+    z = feature_table + 1 # Add pseudo-count (1) 
+    f = log(z)
+    f[f == 0] = NA
+    f = colMeans(f, na.rm = T)
+    f_fit = lm(f ~ group)
+    e = rep(0, length(f))
+    e[!is.na(group)] = residuals(f_fit)
+    y = t(t(z) - e)
+    
+    outlier_check = function(x){
+      # Fitting the mixture model using the algorithm of Peddada, S. Das, and JT Gene Hwang (2002)
+      mu1 = quantile(x, 0.25, na.rm = T)
+      mu2 = quantile(x, 0.75, na.rm = T)
+      sigma1 = quantile(x, 0.75, na.rm = T) - quantile(x, 0.25, na.rm = T)
+      sigma2 = sigma1
+      pi = 0.75
+      n = length(x)
+      epsilon = 100
+      tol = 1e-5
+      score = pi*dnorm(x, mean = mu1, sd = sigma1)/((1 - pi)*dnorm(x, mean = mu2, sd = sigma2))
+      while (epsilon > tol) {
+        grp1_ind = (score >= 1)
+        mu1_new = mean(x[grp1_ind]); mu2_new = mean(x[!grp1_ind])
+        sigma1_new = sd(x[grp1_ind]); if(is.na(sigma1_new)) sigma1_new = 0
+        sigma2_new = sd(x[!grp1_ind]); if(is.na(sigma2_new)) sigma2_new = 0
+        pi_new = sum(grp1_ind)/n
+        
+        para = c(mu1_new, mu2_new, sigma1_new, sigma2_new, pi_new)
+        if(any(is.na(para))) break
+        
+        score = pi_new * dnorm(x, mean = mu1_new, sd = sigma1_new)/
+          ((1-pi_new) * dnorm(x, mean = mu2_new, sd = sigma2_new))
+        
+        epsilon = sqrt((mu1 - mu1_new)^2 + (mu2 - mu2_new)^2 + 
+                         (sigma1 - sigma1_new)^2 + (sigma2 - sigma2_new)^2 + (pi - pi_new)^2)
+        mu1 = mu1_new; mu2 = mu2_new; sigma1 = sigma1_new; sigma2 = sigma2_new; pi = pi_new
+      }
+      
+      if(mu1 + 1.96 * sigma1 < mu2 - 1.96 * sigma2){
+        if(pi < out_cut){
+          out_ind = grp1_ind
+        }else if(pi > 1 - out_cut){
+          out_ind = (!grp1_ind)
+        }else{
+          out_ind = rep(FALSE, n)
+        }
+      }else{
+        out_ind = rep(FALSE, n)
+      }
+      return(out_ind)
+    }
+    out_ind = matrix(FALSE, nrow = nrow(feature_table), ncol = ncol(feature_table))
+    out_ind[, !is.na(group)] = t(apply(y, 1, function(i) 
+      unlist(tapply(i, group, function(j) outlier_check(j)))))
+    
+    feature_table[out_ind] = NA
+  }
+  
+  # 2. Discard taxa with zeros  >=  zero_cut
+  zero_prop = apply(feature_table, 1, function(x) sum(x == 0, na.rm = T)/length(x[!is.na(x)]))
+  taxa_del = which(zero_prop >= zero_cut)
+  if(length(taxa_del) > 0){
+    feature_table = feature_table[- taxa_del, ]
+  }
+  
+  # 3. Discard samples with library size < lib_cut
+  lib_size = colSums(feature_table, na.rm = T)
+  if(any(lib_size < lib_cut)){
+    subj_del = which(lib_size < lib_cut)
+    feature_table = feature_table[, - subj_del]
+    meta_data = meta_data[- subj_del, ]
+  }
+  
+  # 4. Identify taxa with structure zeros
+  if (!is.null(group_var)) {
+    group = factor(meta_data[, group_var])
+    present_table = as.matrix(feature_table)
+    present_table[is.na(present_table)] = 0
+    present_table[present_table != 0] = 1
+    
+    p_hat = t(apply(present_table, 1, function(x)
+      unlist(tapply(x, group, function(y) mean(y, na.rm = T)))))
+    samp_size = t(apply(feature_table, 1, function(x)
+      unlist(tapply(x, group, function(y) length(y[!is.na(y)])))))
+    p_hat_lo = p_hat - 1.96 * sqrt(p_hat * (1 - p_hat)/samp_size)
+    
+    struc_zero = (p_hat == 0) * 1
+    # Whether we need to classify a taxon into structural zero by its negative lower bound?
+    if(neg_lb) struc_zero[p_hat_lo <= 0] = 1
+    
+    # Entries considered to be structural zeros are set to be 0s
+    struc_ind = struc_zero[, group]
+    feature_table = feature_table * (1 - struc_ind)
+    
+    colnames(struc_zero) = paste0("structural_zero (", colnames(struc_zero), ")")
+  }else{
+    struc_zero = NULL
+  }
+  
+  # 5. Return results
+  res = list(feature_table = feature_table, meta_data = meta_data, structure_zeros = struc_zero)
+  return(res)
+}
+
+# ANCOM main function
+ANCOM = function(feature_table, meta_data, struc_zero = NULL, main_var, p_adj_method = "BH", 
+                 alpha = 0.05, adj_formula = NULL, rand_formula = NULL, lme_control = NULL){
+  # OTU table transformation: 
+  # (1) Discard taxa with structural zeros (if any); (2) Add pseudocount (1) and take logarithm.
+  if (!is.null(struc_zero)) {
+    num_struc_zero = apply(struc_zero, 1, sum)
+    comp_table = feature_table[num_struc_zero == 0, ]
+  }else{
+    comp_table = feature_table
+  }
+  comp_table = log(as.matrix(comp_table) + 1)
+  n_taxa = dim(comp_table)[1]
+  taxa_id = rownames(comp_table)
+  n_samp = dim(comp_table)[2]
+  
+  # Determine the type of statistical test and its formula.
+  if (is.null(rand_formula) & is.null(adj_formula)) {
+    # Basic model
+    # Whether the main variable of interest has two levels or more?
+    if (length(unique(meta_data%>%pull(main_var))) == 2) {
+      # Two levels: Wilcoxon rank-sum test
+      tfun = stats::wilcox.test
+    } else{
+      # More than two levels: Kruskal-Wallis test
+      tfun = stats::kruskal.test
+    }
+    # Formula
+    tformula = formula(paste("x ~", main_var, sep = " "))
+  }else if (is.null(rand_formula) & !is.null(adj_formula)) {
+    # Model: ANOVA
+    tfun = stats::aov
+    # Formula
+    tformula = formula(paste("x ~", main_var, "+", adj_formula, sep = " "))
+  }else if (!is.null(rand_formula)) {
+    # Model: Mixed-effects model
+    tfun = nlme::lme
+    # Formula
+    if (is.null(adj_formula)) {
+      # Random intercept model
+      tformula = formula(paste("x ~", main_var))
+    }else {
+      # Random coefficients/slope model
+      tformula = formula(paste("x ~", main_var, "+", adj_formula))
+    }
+  }
+  
+  # Calculate the p-value for each pairwise comparison of taxa.
+  p_data = matrix(NA, nrow = n_taxa, ncol = n_taxa)
+  colnames(p_data) = taxa_id
+  rownames(p_data) = taxa_id
+  pb = txtProgressBar(0, n_taxa - 1, style = 3)
+  for (i in 1:(n_taxa - 1)) {
+    setTxtProgressBar(pb, i)
+    # Loop through each taxon.
+    # For each taxon i, additive log ratio (alr) transform the OTU table using taxon i as the reference.
+    # e.g. the first alr matrix will be the log abundance data (comp_table) recursively subtracted 
+    # by the log abundance of 1st taxon (1st column) column-wisely, and remove the first i columns since:
+    # the first (i - 1) columns were calculated by previous iterations, and
+    # the i^th column contains all zeros.
+    alr_data = apply(comp_table, 1, function(x) x - comp_table[i, ]) 
+    # apply(...) allows crossing the data in a number of ways and avoid explicit use of loop constructs.
+    # Here, we basically want to iteratively subtract each column of the comp_table by its i^th column.
+    alr_data = alr_data[, - (1:i), drop = FALSE]
+    n_lr = dim(alr_data)[2] # number of log-ratios (lr)
+    alr_data = cbind(alr_data, meta_data) # merge with the metadata
+    
+    # P-values
+    if (is.null(rand_formula) & is.null(adj_formula)) {
+      p_data[-(1:i), i] = apply(alr_data[, 1:n_lr, drop = FALSE], 2, function(x){
+        test_data = data.frame(x, alr_data, check.names = FALSE)
+        suppressWarnings(p <- tfun(tformula, data = test_data)$p.value)
+        return(p)
+        }
+      ) 
+    }else if (is.null(rand_formula) & !is.null(adj_formula)) {
+      p_data[-(1:i), i] = apply(alr_data[, 1:n_lr, drop = FALSE], 2, function(x){
+        fit = tfun(tformula, 
+                   data = data.frame(x, alr_data, check.names = FALSE), 
+                   na.action = na.omit)
+         p = summary(fit)[[1]][main_var, "Pr(>F)"]
+         return(p)
+        }
+      )
+    }else if (!is.null(rand_formula)) {
+      p_data[-(1:i), i] = apply(alr_data[, 1:n_lr, drop = FALSE], 2, function(x){
+        fit = try(tfun(fixed = tformula, 
+                       data = data.frame(x, alr_data, check.names = FALSE),
+                       random = formula(rand_formula),
+                       na.action = na.omit,
+                       control = lme_control),
+                  silent = TRUE)
+        
+        if (inherits(fit, "try-error")) {
+          p = NA
+        } else {
+          p = anova(fit)[main_var, "p-value"]
+        }
+        return(p)
+        }
+      ) 
+    }
+  }
+  close(pb)
+  # Complete the p-value matrix.
+  # What we got from above iterations is a lower triangle matrix of p-values.
+  p_data[upper.tri(p_data)] = t(p_data)[upper.tri(p_data)]
+  diag(p_data) = 1 # let p-values on diagonal equal to 1
+  p_data[is.na(p_data)] = 1 # let p-values of NA equal to 1
+  
+  # Multiple comparisons correction.
+  q_data = apply(p_data, 2, function(x) p.adjust(x, method = p_adj_method))
+  
+  # Calculate the W statistic of ANCOM.
+  # For each taxon, count the number of q-values < alpha.
+  W = apply(q_data, 2, function(x) sum(x < alpha))
+  
+  # Organize outputs
+  out_comp = data.frame(taxa_id, W, row.names = NULL, check.names = FALSE)
+  # Declare a taxon to be differentially abundant based on the quantile of W statistic.
+  # We perform (n_taxa - 1) hypothesis testings on each taxon, so the maximum number of rejections is (n_taxa - 1).
+  out_comp = out_comp %>% 
+    mutate(detected_0.9 = ifelse(W > 0.9 * (n_taxa -1), TRUE, FALSE),
+           detected_0.8 = ifelse(W > 0.8 * (n_taxa -1), TRUE, FALSE),
+           detected_0.7 = ifelse(W > 0.7 * (n_taxa -1), TRUE, FALSE),
+           detected_0.6 = ifelse(W > 0.6 * (n_taxa -1), TRUE, FALSE))
+  
+  # Taxa with structural zeros are automatically declared to be differentially abundant
+  if (!is.null(struc_zero)){
+    out = data.frame(taxa_id = rownames(struc_zero), W = Inf, detected_0.9 = TRUE, 
+                     detected_0.8 = TRUE, detected_0.7 = TRUE, detected_0.6 = TRUE, 
+                     row.names = NULL, check.names = FALSE)
+    out[match(taxa_id, out$taxa_id), ] = out_comp
+  }else{
+    out = out_comp
+  }
+  
+  # Draw volcano plot
+  # Calculate clr
+  clr_table = apply(feature_table, 2, clr)
+  # Calculate clr mean difference
+  eff_size = apply(clr_table, 1, function(y) 
+    lm(y ~ x, data = data.frame(y = y, 
+                                x = meta_data %>% pull(main_var),
+                                check.names = FALSE))$coef[-1])
+  
+  if (is.matrix(eff_size)){
+    # Data frame for the figure
+    dat_fig = data.frame(taxa_id = out$taxa_id, t(eff_size), y = out$W, check.names = FALSE) %>% 
+      mutate(zero_ind = factor(ifelse(is.infinite(y), "Yes", "No"), levels = c("Yes", "No"))) %>%
+      gather(key = group, value = x, rownames(eff_size))
+    # Replcace "x" to the name of covariate
+    dat_fig$group = sapply(dat_fig$group, function(x) gsub("x", paste0(main_var, " = "), x))
+    # Replace Inf by (n_taxa - 1) for structural zeros
+    dat_fig$y = replace(dat_fig$y, is.infinite(dat_fig$y), n_taxa - 1)
+    
+    fig = ggplot(data = dat_fig) + aes(x = x, y = y) + 
+      geom_point(aes(color = zero_ind)) + 
+      facet_wrap(~ group) +
+      labs(x = "CLR mean difference", y = "W statistic") +
+      scale_color_discrete(name = "Structural zero", drop = FALSE) + 
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5), legend.position = "top",
+            strip.background = element_rect(fill = "white"))
+    fig  
+  } else{
+    # Data frame for the figure
+    dat_fig = data.frame(taxa_id = out$taxa_id, x = eff_size, y = out$W) %>% 
+      mutate(zero_ind = factor(ifelse(is.infinite(y), "Yes", "No"), levels = c("Yes", "No")))
+    # Replace Inf by (n_taxa - 1) for structural zeros
+    dat_fig$y = replace(dat_fig$y, is.infinite(dat_fig$y), n_taxa - 1)
+    
+    fig = ggplot(data = dat_fig) + aes(x = x, y = y) + 
+      geom_point(aes(color = zero_ind)) + 
+      labs(x = "CLR mean difference", y = "W statistic") +
+      scale_color_discrete(name = "Structural zero", drop = FALSE) + 
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5), legend.position = "top")
+    fig
+  }
+  
+  res = list(p_data = p_data, q_data = q_data, out = out, fig = fig)
+  return(res)
+}
+```
+
+```{r}
+#Immune gene panel 
+gene_immune_names <- c(
+"A2M", "ABCB1", "ABL1", "ADA", "ADORA2A", "AICDA", "AIRE", "AKT3", "ALCAM", "AMBP",
+"AMICA1", "ANP32B", "ANXA1", "APOE", "APP", "ARG1", "ARG2", "ATF1", "ATF2", "ATG10",
+"ATG12", "ATG16L1", "ATG5", "ATG7", "ATM", "AXL", "BATF", "BAX", "BCL10", "BCL2",
+"BCL2L1", "BCL6", "BID", "BIRC5", "BLK", "BLNK", "BMI1", "BST1", "BST2", "BTK",
+"BTLA", "C1QA", "C1QB", "C1QBP", "C1R", "C1S", "C2", "C3", "C3AR1", "C4B", "C4BPA",
+"C5", "C6", "C7", "C8A", "C8B", "C8G", "C9", "CAMP", "CARD11", "CARD9", "CASP1",
+"CASP10", "CASP3", "CASP8", "CCL1", "CCL11", "CCL13", "CCL14", "CCL15", "CCL16",
+"CCL17", "CCL18", "CCL19", "CCL2", "CCL20", "CCL21", "CCL22", "CCL23", "CCL24",
+"CCL25", "CCL26", "CCL27", "CCL28", "CCL3", "CCL3L1", "CCL4", "CCL5", "CCL7", "CCL8",
+"CCND3", "CCR1", "CCR2", "CCR3", "CCR4", "CCR5", "CCR6", "CCR7", "CCR9", "CCRL2",
+"CD14", "CD160", "CD163", "CD164", "CD180", "CD19", "CD1A", "CD1B", "CD1C", "CD1D",
+"CD1E", "CD2", "CD200", "CD207", "CD209", "CD22", "CD24", "CD244", "CD247", "CD27",
+"CD274", "CD276", "CD28", "CD33", "CD34", "CD36", "CD37", "CD38", "CD3D", "CD3E",
+"CD3EAP", "CD3G", "CD4", "CD40", "CD40LG", "CD44", "CD46", "CD47", "CD48", "CD5",
+"CD53", "CD55", "CD58", "CD59", "CD6", "CD63", "CD68", "CD7", "CD70", "CD74", "CD79A",
+"CD79B", "CD80", "CD81", "CD83", "CD84", "CD86", "CD8A", "CD8B", "CD9", "CD96", "CD97",
+"CD99", "CDH1", "CDH5", "CDK1", "CDKN1A", "CEACAM1", "CEACAM6", "CEACAM8", "CEBPB",
+"CFB", "CFD", "CFI", "CFP", "CHIT1", "CHUK", "CKLF", "CLEC4A", "CLEC4C", "CLEC5A",
+"CLEC6A", "CLEC7A", "CLU", "CMA1", "CMKLR1", "COL3A1", "COLEC12", "CR1", "CR2", "CREB1",
+"CREB5", "CREBBP", "CRP", "CSF1", "CSF1R", "CSF2", "CSF2RB", "CSF3", "CSF3R", "CTLA4",
+"CTSG", "CTSH", "CTSL", "CTSS", "CTSW", "CX3CL1", "CX3CR1", "CXCL1", "CXCL10", "CXCL11",
+"CXCL12", "CXCL13", "CXCL14", "CXCL16", "CXCL2", "CXCL3", "CXCL5", "CXCL6", "CXCL9",
+"CXCR1", "CXCR2", "CXCR3", "CXCR4", "CXCR5", "CXCR6", "CYBB", "CYFIP2", "CYLD", "DDX58",
+"DEFB1", "DMBT1", "DOCK9", "DPP4", "DUSP4", "DUSP6", "EBI3", "ECSIT", "EGR1", "EGR2",
+"ELANE", "ELK1", "ENG", "ENTPD1", "EOMES", "EP300", "EPCAM", "ETS1", "EWSR1", "F12",
+"F13A1", "F2RL1", "FADD", "FAS", "FCER1A", "FCER1G", "FCER2", "FCGR1A", "FCGR2A",
+"FCGR2B", "FCGR3A", "FEZ1", "FLT3", "FLT3LG", "FN1", "FOS", "FOXJ1", "FOXP3", "FPR2",
+"FUT5", "FUT7", "FYN", "GATA3", "GNLY", "GPI", "GTF3C1", "GZMA", "GZMB", "GZMH", "GZMK",
+"GZMM", "HAMP", "HAVCR2", "HCK", "HLA-A", "HLA-B", "HLA-C", "HLA-DMA", "HLA-DMB", "HLA-DOB",
+"HLA-DPA1", "HLA-DPB1", "HLA-DQA1", "HLA-DQB1", "HLA-DRA", "HLA-DRB3", "HLA-DRB4", "HLA-E",
+"HLA-G", "HMGB1", "HRAS", "HSD11B1", "ICAM1", "ICAM2", "ICAM3", "ICAM4", "ICOS", "ICOSLG",
+"IDO1", "IFI16", "IFI27", "IFI35", "IFIH1", "IFIT1", "IFIT2", "IFITM1", "IFITM2", "IFNA1",
+"IFNA17", "IFNA2", "IFNA7", "IFNA8", "IFNAR1", "IFNAR2", "IFNB1", "IFNG", "IFNGR1", "IFNL1",
+"IFNL2", "IGF1R", "IGF2R", "IGLL1", "IKBKB", "IKBKE", "IKBKG", "IL10", "IL10RA", "IL11",
+"IL11RA", "IL12A", "IL12B", "IL12RB1", "IL12RB2", "IL13", "IL13RA1", "IL13RA2", "IL15",
+"IL15RA", "IL16", "IL17A", "IL17B", "IL17F", "IL17RA", "IL17RB", "IL18", "IL18R1", "IL18RAP",
+"IL19", "IL1A", "IL1B", "IL1R1", "IL1R2", "IL1RAP", "IL1RAPL2", "IL1RL1", "IL1RL2", "IL1RN",
+"IL2", "IL21", "IL21R", "IL22", "IL22RA1", "IL22RA2", "IL23A", "IL23R", "IL24", "IL25",
+"IL26", "IL27", "IL2RA", "IL2RB", "IL2RG", "IL3", "IL32", "IL34", "IL3RA", "IL4", "IL4R",
+"IL5", "IL5RA", "IL6", "IL6R", "IL6ST", "IL7", "IL7R", "IL8", "IL9", "ILF3", "INPP5D", "IRAK1",
+"IRAK2", "IRAK4", "IRF1", "IRF2", "IRF3", "IRF4", "IRF5", "IRF7", "IRF8", "IRGM", "ISG15",
+"ISG20", "ITCH", "ITGA1", "ITGA2", "ITGA2B", "ITGA4", "ITGA5", "ITGA6", "ITGAE", "ITGAL",
+"ITGAM", "ITGAX", "ITGB1", "ITGB2", "ITGB3", "ITGB4", "ITK", "JAK1", "JAK2", "JAK3", "JAM3",
+"KIR_Activating_Subgroup_1", "KIR_Activating_Subgroup_2", "KIR_Inhibiting_Subgroup_1",
+"KIR_Inhibiting_Subgroup_2", "KIR3DL1", "KIR3DL2", "KIR3DL3", "KIT", "KLRB1", "KLRC1",
+"KLRC2", "KLRD1", "KLRF1", "KLRG1", "KLRK1", "LAG3", "LAIR2", "LAMP1", "LAMP2", "LAMP3",
+"LBP", "LCK", "LCN2", "LCP1", "LGALS3", "LIF", "LILRA1", "LILRA4", "LILRA5", "LILRB1",
+"LILRB2", "LILRB3", "LRP1", "LRRN3", "LTA", "LTB", "LTBR", "LTF", "LTK", "LY86", "LY9",
+"LY96", "LYN", "MAF", "MAP2K1", "MAP2K2", "MAP2K4", "MAP3K1", "MAP3K5", "MAP3K7", "MAP4K2",
+"MAPK1", "MAPK11", "MAPK14", "MAPK3", "MAPK8", "MAPKAPK2", "MARCO", "MASP1", "MASP2",
+"MAVS", "MBL2", "MCAM", "MEF2C", "MEFV", "MERTK", "MFGE8", "MICA", "MICB", "MIF", "MME",
+"MNX1", "MPPED1", "MR1", "MRC1", "MS4A1", "MS4A2", "MSR1", "MST1R", "MUC1", "MX1", "MYD88",
+"NCAM1", "NCF4", "NCR1", "NEFL", "NFATC1", "NFATC2", "NFATC3", "NFATC4", "NFKB1", "NFKB2",
+"NFKBIA", "NLRC5", "NLRP3", "NOD1", "NOD2", "NOS2A", "NOTCH1", "NRP1", "NT5E", "NUP107",
+"OAS3", "OSM", "PAX5", "PDCD1", "PDCD1LG2", "PDGFC", "PDGFRB", "PECAM1", "PIK3CD", "PIK3CG",
+"PIN1", "PLA2G1B", "PLA2G6", "PLAU", "PLAUR", "PMCH", "PNMA1", "POU2AF1", "POU2F2", "PPARG",
+"PPBP", "PRF1", "PRG2", "PRKCD", "PRKCE", "PSEN1", "PSEN2", "PSMB10", "PSMB7", "PSMB8",
+"PSMB9", "PSMD7", "PTGDR2", "PTGS2", "PTPRC", "PVR", "PYCARD", "RAG1", "REL", "RELA", "RELB",
+"REPS1", "RIPK2", "RORA", "RORC", "RPS6", "RRAD", "RUNX1", "RUNX3", "S100A12", "S100A7",
+"S100A8", "S100B", "SAA1", "SBNO2", "SELE", "SELL", "SELPLG", "SERPINB2", "SERPING1", "SH2B2",
+"SH2D1A", "SH2D1B", "SIGIRR", "SIGLEC1", "SLAMF1", "SLAMF6", "SLAMF7", "SLC11A1", "SMAD2",
+"SMAD3", "SMPD3", "SOCS1", "SPINK5", "SPN", "SPP1", "ST6GAL1", "STAT1", "STAT2", "STAT3",
+"STAT4", "STAT5B", "STAT6", "SYK", "SYT17", "TAB1", "TAL1", "TANK", "TAP1", "TAP2", "TAPBP",
+"TARP", "TBK1", "TBX21", "TCF7", "TFE3", "TFEB", "TFRC", "TGFB1", "TGFB2", "THBD", "THBS1",
+"THY1", "TICAM1", "TICAM2", "TIGIT", "TIRAP", "TLR1", "TLR10", "TLR2", "TLR3", "TLR4", "TLR5",
+"TLR6", "TLR7", "TLR8", "TLR9", "TNF", "TNFAIP3", "TNFRSF10B", "TNFRSF10C", "TNFRSF11A",
+"TNFRSF11B", "TNFRSF12A", "TNFRSF13B", "TNFRSF13C", "TNFRSF14", "TNFRSF17", "TNFRSF18",
+"TNFRSF1A", "TNFRSF1B", "TNFRSF4", "TNFRSF8", "TNFRSF9", "TNFSF10", "TNFSF11", "TNFSF12",
+"TNFSF13", "TNFSF13B", "TNFSF14", "TNFSF15", "TNFSF18", "TNFSF4", "TNFSF8", "TOLLIP", "TP53",
+"TPSAB1", "TRAF2", "TRAF3", "TRAF6", "TREM1", "TREM2", "TXK", "TXNIP", "TYK2", "UBC", "ULBP2",
+"USP9Y", "VCAM1", "VEGFA", "VEGFC", "XCL2", "XCR1", "YTHDF2", "ZAP70", "ZNF205"
+)
+```
+
+```{r}
+PATH="/Users/eemanabbasi/Desktop/paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/"
+
+counts <- read.csv('/Users/eemanabbasi/Desktop/paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/TCGA_OTU.tsv', sep = "\t",row.names = 1,check.names = FALSE) 
+qcMet<-  read.csv("/Users/eemanabbasi/Desktop//paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/metadata_species_WIS_overlapping_fungi_bacteria_12773samples.tsv" ,sep='\t',row.names = 1)
+
+
+subtype_clinical <- read.csv("/Users/eemanabbasi/Desktop/subtypes_clinical_data.tsv", sep = '\t', header = TRUE)
+subtype_clinical <- subtype_clinical[!duplicated(rownames(subtype_clinical)), ]
+subtype_df <- data.frame(patient_id = subtype_clinical$Patient.ID,Subtype = subtype_clinical$Subtype)
+
+matching_ids <- intersect(qcMet$tcga_case_id, subtype_clinical$Patient.ID)
+matched_subtypes <- subset(subtype_clinical, Patient.ID %in% matching_ids)
+qcMet$Subtype <- NA
+
+for (id in matching_ids) {
+  qcMet[qcMet$tcga_case_id == id & !is.na(qcMet$tcga_case_id), "Subtype"] <- matched_subtypes[matched_subtypes$Patient.ID == id, "Subtype"]
+}
+
+tax<- read.table('/Users/eemanabbasi/Desktop//paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/taxonomy_table_WIS_overlapping_fungi_bacteria.txt', sep = "\t", row.names = 1)
+
+immune_tcga = read.table("/Users/eemanabbasi/Desktop//paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/tcga_immune/tcga_immune.txt", sep = "\t", encoding = "UTF-16", row.names = 1)
+
+coverage <- read.table('/Users/eemanabbasi/Desktop/paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/cgc_idxstats_mycobiome_all_total_reads_gdp_29Sep21.txt', sep = "\t")
+colnames(coverage) <- coverage[1,]
+coverage <- coverage[-1,]
+
+sample_name <- coverage[,1]
+matched_sample_names <- coverage[sample_name %in% qcMet$filename, ]
+matched_qcMet <- qcMet[qcMet$filename %in% sample_name, ]
+qcMet <- cbind(matched_qcMet, matched_sample_names[, -1])
+
+col_names <- as.character(immune_tcga[1, ])
+colnames(immune_tcga) <- col_names
+immune_tcga <- immune_tcga[-1, ]
+colnames(immune_tcga) <- gsub(" ", "_", colnames(immune_tcga))
+
+replace_tissue_normal <- function(sample_type) {
+  return(gsub("Solid Tissue Normal", "Normal", sample_type))
+}
+replace_blood_normal <- function(sample_type) {
+  return(gsub("Blood Derived Normal", "Normal", sample_type))
+}
+
+replace_tissue_tumor <- function(sample_type) {
+  return(gsub("Recurrent Tumor", "Tumor", sample_type))
+}
+replace_met_tumor <- function(sample_type) {
+  return(gsub("Metastatic", "Tumor", sample_type))
+}
+replace_tumor <- function(sample_type) {
+  return(gsub("Primary Tumor", "Tumor", sample_type))
+}
+
+replace_add_tumor <- function(sample_type) {
+  return(gsub("Additional - New Primary Tumor", "Tumor", sample_type))
+}
+
+# Apply the function to a vector of sample types
+qcMet$sample_type <- replace_tissue_normal(qcMet$sample_type)
+qcMet$sample_type <- replace_blood_normal(qcMet$sample_type)
+
+qcMet$sample_type <- replace_tissue_tumor(qcMet$sample_type)
+qcMet$sample_type <- replace_met_tumor(qcMet$sample_type)
+qcMet$sample_type <- replace_tumor(qcMet$sample_type)
+qcMet$sample_type <- replace_add_tumor(qcMet$sample_type)
+
+#qcMet <- qcMet[qcMet$sample_type != "Recurrent Tumor", ]
+
+colnames(counts)<- rownames(qcMet)
+colnames(tax) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax <- tax[match(rownames(counts), rownames(tax)),]
+```
+
+
+
+```{r}
+get_samples <- function(cancer_name, state){
+  
+qcMet['SampleID'] = rownames(qcMet)
+#source_to_exclude = "Canada's Michael Smith Genome Sciences Centre"
+
+filtered_samples <- qcMet %>%
+  filter(data_submitting_center_label != "University of North Carolina", investigation == cancer_name, sample_type == state)
+
+matching_row_names <- colnames(counts) %in% filtered_samples$SampleID
+counts_filt <- counts[matching_row_names]
+
+counts_filt <- counts_filt[rowSums(counts_filt) >= 500, ]
+
+counts_filt< - counts_filt[,colSums(counts_filt) > 0]
+matching_row_names <- rownames(counts_filt) %in% rownames(tax)
+tax_filt <- tax[matching_row_names,]
+
+matching_index <- which(rownames(immune_tcga) %in% filtered_samples$tcga_case_id)
+immune_tcga_filt <- immune_tcga[matching_index,]
+
+#taxa_df <- t(counts_filt)
+#batch_id <- filtered_samples$data_submitting_center_label
+#batch_id_factor <- factor(filtered_samples$data_submitting_center_label)
+
+#covariates <- filtered_samples[,c('gender','race')]
+#options(warn=-1)
+#taxa_corrected1 = ConQuR(tax_tab=taxa_df, batchid=batch_id_factor, covariates=covariates, batch_ref="Canada's Michael Smith Genome Sciences Centre")
+#counts_final = t(taxa_corrected1)
+
+otda<- as.matrix.data.frame((counts_filt))
+OTU = phyloseq::otu_table(otda, taxa_are_rows=TRUE)
+tax_t<- as.matrix.data.frame(tax_filt)
+taxda<- phyloseq::tax_table(tax_t)
+sample<- phyloseq::sample_data(filtered_samples)
+ps_tumor_raw <- phyloseq::phyloseq(OTU, sample, taxda)
+ps_tumor <- phyloseq::phyloseq(OTU, sample, taxda)
+sample_ids <- names(counts_filt)
+
+output = c(ps_tumor_raw = ps_tumor_raw, ps_tumor = ps_tumor,filtered_samples = filtered_samples, sample_ids = sample_ids ,tax_filt = tax_filt)
+return(output)
+
+}
+
+normalize_ps <- function(ps_tumor){
+  cts <- ps_tumor@otu_table
+  sample_totals <- colSums(cts)
+  relative_abundance <- cts / sample_totals
+  xt <- clr(relative_abundance)
+  OTU = phyloseq::otu_table(xt, taxa_are_rows=TRUE)
+  sample<- phyloseq::sample_data(ps_tumor@sam_data)
+  taxTable <- phyloseq::tax_table(ps_tumor@tax_table)
+  ps_tumor_clr <- phyloseq::phyloseq(OTU, sample,taxTable)
+return(ps_tumor_clr)
+}
+
+normalize_ps_coverage <- function(ps_tumor){
+  cts <- ps_tumor@otu_table
+  coverage <-  as.numeric(ps_tumor@sam_data$total) #microbiome reads total, mapped represents humans, and umpapped contains both human and microbial reads.
+  relative_abundance <- cts/coverage
+  xt <- (relative_abundance)
+  print("log has been taken")
+  OTU = phyloseq::otu_table(xt, taxa_are_rows=TRUE)
+  sample<- phyloseq::sample_data(ps_tumor@sam_data)
+  taxTable <- phyloseq::tax_table(ps_tumor@tax_table)
+  ps_tumor_clr <- phyloseq::phyloseq(OTU, sample,taxTable)
+return(ps_tumor_clr)
+}
+
+
+
+plot_data_df <- function(ps_clr){
+  tumor_counts <- phyloseq::otu_table(ps_clr)
+  observed_richness = colSums(tumor_counts>0)
+  if (!is.null(ps_clr@sam_data$Group)){
+    plot_data <- data.frame(species_richness = observed_richness, CLR_abundance = log(colSums(tumor_counts)), shipping_labels = ps_clr@sam_data$data_submitting_center_label, Group = ps_clr@sam_data$Group)
+  }
+  else{
+      plot_data <- data.frame(species_richness = observed_richness, CLR_abundance = log(colSums(tumor_counts)), shipping_labels = ps_clr@sam_data$data_submitting_center_label)
+      phyloseq::sample_data(ps_clr)$microbiome_richness = colSums(tumor_counts>0)
+      phyloseq::sample_data(ps_clr)$microbiome_abundance = log(colSums(tumor_counts))
+      
+      
+  }
+  output <- c(list(plot_data = plot_data, ps_clr = ps_clr))
+  return(output)
+}
+
+assign_groups_abundance<- function(plot_data, ps_tumor_clr) {
+  
+  samples_in_low_richness <- plot_data[plot_data$CLR_abundance < quantile(plot_data$CLR_abundance, prob = 0.25), ]
+  samples_in_high_richness <- plot_data[plot_data$CLR_abundance > quantile(plot_data$CLR_abundance, prob = 0.75), ]
+  
+ #samples_in_low_richness <- plot_data[plot_data$species_richness < quantile(plot_data$species_richness, prob = 0.25) & plot_data$CLR_abundance < quantile(plot_data$CLR_abundance, prob = 0.25), ]
+ # samples_in_high_richness <- plot_data[plot_data$species_richness > quantile(plot_data$species_richness, prob = 0.75) & plot_data$CLR_abundance > quantile(plot_data$CLR_abundance, prob = 0.75), ]
+  
+  #print(quantile(plot_data$species_richness, prob = 0.60))
+  
+  samples_in_low_richness$QuantileLabel <- "Low"
+  samples_in_high_richness$QuantileLabel <- "High"
+  
+  not_used_samples <- plot_data[!(row.names(plot_data) %in% row.names(samples_in_low_richness) | row.names(plot_data) %in% row.names(samples_in_high_richness)), ]
+  not_used_samples$QuantileLabel <- "not_used_samples"
+  combined_samples <- rbind(samples_in_low_richness, samples_in_high_richness, not_used_samples)
+  combined_samples_reordered <- combined_samples[rownames(phyloseq::sample_data(ps_tumor_clr)), ]
+  phyloseq::sample_data(ps_tumor_clr)$Group <- combined_samples_reordered$QuantileLabel
+  
+  
+  ps_sample_names <- rownames(phyloseq::sample_data(ps_tumor_clr))
+  plot_sample_names <- rownames(plot_data)
+  
+
+  ordered_plot_data <- plot_data[match(ps_sample_names, plot_sample_names), ]
+  phyloseq::sample_data(ps_tumor_clr)$Microbiome_Richness <- ordered_plot_data$species_richness
+  phyloseq::sample_data(ps_tumor_clr)$Microbiome_Abundance <- ordered_plot_data$CLR_abundance
+  
+  #phyloseq::sample_data(ps_tumor_clr)$Group <- relevel(Group, ref = "Low")
+
+  output = list(ps_tumor_clr=ps_tumor_clr, combined_samples=combined_samples_reordered)
+
+  return(output)
+}
+
+assign_groups_richness<- function(plot_data, ps_tumor_clr) {
+  
+  samples_in_low_richness <- plot_data[plot_data$species_richness < quantile(plot_data$species_richness, prob = 0.25), ]
+  samples_in_high_richness <- plot_data[plot_data$species_richness > quantile(plot_data$species_richness, prob = 0.75), ]
+  
+ #samples_in_low_richness <- plot_data[plot_data$species_richness < quantile(plot_data$species_richness, prob = 0.25) & plot_data$CLR_abundance < quantile(plot_data$CLR_abundance, prob = 0.25), ]
+  #samples_in_high_richness <- plot_data[plot_data$species_richness > quantile(plot_data$species_richness, prob = 0.75) & plot_data$CLR_abundance > quantile(plot_data$CLR_abundance, prob = 0.75), ]
+  
+  #print(quantile(plot_data$species_richness, prob = 0.60))
+  
+  samples_in_low_richness$QuantileLabel <- "Low"
+  samples_in_high_richness$QuantileLabel <- "High"
+  
+  not_used_samples <- plot_data[!(row.names(plot_data) %in% row.names(samples_in_low_richness) | row.names(plot_data) %in% row.names(samples_in_high_richness)), ]
+  not_used_samples$QuantileLabel <- "not_used_samples"
+  combined_samples <- rbind(samples_in_low_richness, samples_in_high_richness, not_used_samples)
+  combined_samples_reordered <- combined_samples[rownames(phyloseq::sample_data(ps_tumor_clr)), ]
+  phyloseq::sample_data(ps_tumor_clr)$Group <- combined_samples_reordered$QuantileLabel
+  
+  
+  
+  
+  ps_sample_names <- rownames(phyloseq::sample_data(ps_tumor_clr))
+  plot_sample_names <- rownames(plot_data)
+
+  ordered_plot_data <- plot_data[match(ps_sample_names, plot_sample_names), ]
+  phyloseq::sample_data(ps_tumor_clr)$Microbiome_Richness <- ordered_plot_data$species_richness
+  phyloseq::sample_data(ps_tumor_clr)$Microbiome_Abundance <- ordered_plot_data$CLR_abundance
+  
+  #phyloseq::sample_data(ps_tumor_clr)$Group <- relevel(Group, ref = "Low")
+
+  
+  output = list(ps_tumor_clr=ps_tumor_clr, combined_samples=combined_samples_reordered)
+
+  return(output)
+}
+
+assign_groups_richness_abundance<- function(plot_data, ps_tumor_clr) {
+  
+ samples_in_low_richness <- plot_data[plot_data$species_richness < quantile(plot_data$species_richness, prob = 0.25) & plot_data$CLR_abundance < quantile(plot_data$CLR_abundance, prob = 0.25), ]
+  samples_in_high_richness <- plot_data[plot_data$species_richness > quantile(plot_data$species_richness, prob = 0.75) & plot_data$CLR_abundance > quantile(plot_data$CLR_abundance, prob = 0.75), ]
+  
+  #print(quantile(plot_data$species_richness, prob = 0.60))
+  
+  samples_in_low_richness$QuantileLabel <- "Low"
+  samples_in_high_richness$QuantileLabel <- "High"
+  
+  not_used_samples <- plot_data[!(row.names(plot_data) %in% row.names(samples_in_low_richness) | row.names(plot_data) %in% row.names(samples_in_high_richness)), ]
+  not_used_samples$QuantileLabel <- "not_used_samples"
+  combined_samples <- rbind(samples_in_low_richness, samples_in_high_richness, not_used_samples)
+  combined_samples_reordered <- combined_samples[rownames(phyloseq::sample_data(ps_tumor_clr)), ]
+  phyloseq::sample_data(ps_tumor_clr)$Group <- combined_samples_reordered$QuantileLabel
+  
+  
+  
+  
+  ps_sample_names <- rownames(phyloseq::sample_data(ps_tumor_clr))
+  plot_sample_names <- rownames(plot_data)
+
+  ordered_plot_data <- plot_data[match(ps_sample_names, plot_sample_names), ]
+  phyloseq::sample_data(ps_tumor_clr)$Microbiome_Richness <- ordered_plot_data$species_richness
+  phyloseq::sample_data(ps_tumor_clr)$Microbiome_Abundance <- ordered_plot_data$CLR_abundance
+  
+  #phyloseq::sample_data(ps_tumor_clr)$Group <- relevel(Group, ref = "Low")
+
+  
+  output = list(ps_tumor_clr=ps_tumor_clr, combined_samples=combined_samples_reordered)
+
+  return(output)
+}
+
+assign_groups_random <- function(plot_data, ps_tumor_clr) {
+  
+  # Shuffle the dataset
+  shuffled_data <- plot_data[sample(nrow(plot_data)), ]
+  
+  # Calculate the number of samples to be assigned to each category
+  total_samples <- nrow(shuffled_data)
+  low_high_samples <- floor(total_samples * 0.4)  # 40% for low and high combined
+  not_used_samples <- total_samples - (2 * low_high_samples)
+  
+  # Randomly select samples for low richness and low CLR abundance
+  low_richness_samples <- shuffled_data[sample(nrow(shuffled_data), size = low_high_samples), ]
+  
+  # Randomly select samples for high richness and high CLR abundance
+  high_richness_samples <- shuffled_data[
+    !(rownames(shuffled_data) %in% row.names(low_richness_samples)), 
+    ,
+    drop = FALSE
+  ][sample(nrow(shuffled_data) - nrow(low_richness_samples), size = low_high_samples), ]
+  
+  # Remaining samples will be labeled as not used
+  not_used_samples_df <- shuffled_data[
+    !(rownames(shuffled_data) %in% row.names(low_richness_samples) | row.names(shuffled_data) %in% row.names(high_richness_samples)), 
+  ]
+  
+  # Randomly select a subset of not used samples if they exceed the desired count
+  if (nrow(not_used_samples_df) > not_used_samples) {
+    not_used_samples_df <- not_used_samples_df[sample(nrow(not_used_samples_df), size = not_used_samples), ]
+  }
+  
+  # Assign labels to samples
+  low_richness_samples$QuantileLabel <- "Low"
+  high_richness_samples$QuantileLabel <- "High"
+  not_used_samples_df$QuantileLabel <- "Not Used"
+  
+  # Combine samples
+  combined_samples <- rbind(low_richness_samples, high_richness_samples, not_used_samples_df)
+  
+  # Reorder combined samples to match phyloseq sample order
+  combined_samples_reordered <- combined_samples[rownames(phyloseq::sample_data(ps_tumor_clr)), ]
+  
+  # Assign groups to sample data in phyloseq object
+  phyloseq::sample_data(ps_tumor_clr)$Group <- combined_samples_reordered$QuantileLabel
+  
+  
+  # Return the updated phyloseq object and combined samples
+  output <- list(ps_tumor_clr = ps_tumor_clr, combined_samples = combined_samples)
+  
+  return(output)
+}
+
+
+
+filtered_ps <- function(ps_tumor_clr, ps_tumor_raw){
+  ps_tumor_filtered <- subset_samples(ps_tumor_clr, Group %in% c("High", "Low"))
+  sample_data(ps_tumor_raw)$Group <- sample_data(ps_tumor_clr)$Group
+  ps_tumor_raw <- subset_samples(ps_tumor_raw, Group %in% c("High", "Low"))
+  output <- c(ps_tumor_filtered= ps_tumor_filtered,ps_tumor_raw=ps_tumor_raw )
+  return(output)
+}
+
+
+
+
+######################################################################################################################################################################################################################### 
+
+```
+
+#Generate the richness and the abundance plots function 
+```{r}
+generate_richness_abundance_plots <- function(cancer_name, state, path_to_save){
+color_mapping <- c(
+  "Washington University School of Medicine" = "#66c2a5",        # Greenish Blue
+  "Broad Institute of MIT and Harvard" = "#fc8d62",             # Salmon
+  "Baylor College of Medicine" = "#8da0cb",                     # Light Blue
+  "Harvard Medical School" = "#e78ac3",                        # Pinkish
+  "MD Anderson - Institute for Applied Cancer Science" = "#a6d854", # Light Green
+  "MD Anderson - RPPA Core Facility (Proteomics)" = "#ffd92f",  # Yellow
+  "University of North Carolina" = "#e5c494",                   # Beige
+  "Canada's Michael Smith Genome Sciences Centre" = "#b3b3b3"   # Gray
+)
+
+richness_abundnace <- ggplot(plot_data$plot_data, aes(x=species_richness, y=(CLR_abundance))) +
+      geom_point(size = 4, show.legend = TRUE) +  # Add show.legend for debugging colors
+      theme_bw() +
+      theme(panel.grid = element_blank()) +
+      labs(x = "Observed Richness", y = "log(Abundance)") +
+      theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+      )
+richness_abundnace
+
+filepath = paste0(path_to_save, "richabun_",cancer_name,"_",state,"_plot.pdf")
+ggsave(filepath, richness_abundnace, device = "pdf", width = 8, height = 6, units = "in")
+
+
+richness_abundnace_gplot <- ggplot(plot_data$plot_data, aes(x=species_richness, y=(CLR_abundance), color=shipping_labels)) +
+      geom_point(size = 4, show.legend = TRUE) +  # Add show.legend for debugging colors
+      theme_bw() +
+      theme(panel.grid = element_blank()) +
+      scale_color_manual(values = color_mapping) +  # Specify the color mapping
+      labs(x = "Observed Richness", y = "log(Abundance)") +
+      theme(
+        plot.title = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)
+      )
+richness_abundnace_gplot
+
+# Assuming 'plot' is your ggplot object
+filepath = paste0(path_to_save, "richness_abundnace_",cancer_name,"_",state,"_gplot.pdf")
+ggsave(filepath, richness_abundnace_gplot, device = "pdf", width = 8, height = 6, units = "in")
+
+
+quantile_plot <- ggplot(as_out$combined_samples, aes(x = species_richness, y = (CLR_abundance), color = QuantileLabel)) +
+  geom_point(size = 4) +
+  geom_point(data = as_out$combined_samples[as_out$combined_samples$QuantileLabel == "not_used_samples",], aes(x = species_richness, y = CLR_abundance), size = 3, shape = 1, color = "gray") +
+  scale_color_manual(values = c("Low" = "#FD9347", "High" = "#00AED7", "not_used_samples" = "gray"), breaks = c("Low", "High"), name = "Quantiles") +  # Specify the breaks and legend title
+  theme_bw() +
+  theme(panel.grid = element_blank(), plot.title = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 12),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 14)) +
+  labs(x = "Observed Richness", y = "log(Abundance)")
+
+quantile_plot
+# Assuming 'plot' is your ggplot object
+filepath = paste0(path_to_save, "quantile_",cancer_name,"_",state,"_plot.pdf")
+ggsave(filepath, quantile_plot, device = "pdf", width = 8, height = 6, units = "in")
+
+}
+
+```
+
+#Run ANCOMB analysis for each of the chosen cancer state
+```{r}
+run_ancomb <- function(ps_tumor_raw, cancer_name, state, path_to_save){
+
+  otu_os <- ps_tumor_raw@otu_table
+  sample_df <- ps_tumor_raw@sam_data
+  sample_df['sample_id'] = rownames(ps_tumor_raw@sam_data)
+  
+  feature_table = otu_os; sample_var = "sample_id"; group_var = NULL
+  out_cut = 0.05; zero_cut = 0.90; lib_cut = 1000; neg_lb = FALSE
+  prepro = feature_table_pre_process(feature_table, sample_df, sample_var, group_var, 
+                                     out_cut, zero_cut, lib_cut, neg_lb)
+  feature_table = prepro$feature_table # Preprocessed feature table
+  meta_data = prepro$meta_data # Preprocessed metadata
+  struc_zero = prepro$structure_zeros # Structural zero info
+  
+  
+  main_var = "Group"; p_adj_method = "BH"; alpha = 0.05
+  
+  if(length(unique(sample_df$data_submitting_center_label)) == 1){
+  adj_formula = "age_at_diagnosis"; rand_formula = NULL; lme_control = NULL
+  }
+  else{
+      adj_formula = "data_submitting_center_label + age_at_diagnosis + gender"; rand_formula = NULL; lme_control = NULL
+  }
+  
+  res = ANCOM(feature_table, meta_data, struc_zero, main_var, p_adj_method, 
+              alpha, adj_formula, rand_formula, lme_control)
+  
+  # Number of taxa except structural zeros
+  n_taxa = ifelse(is.null(struc_zero), nrow(feature_table), sum(apply(struc_zero, 1, sum) == 0))
+  # Cutoff values for declaring differentially abundant taxa
+  cut_off = c(0.9 * (n_taxa - 1), 0.8 * (n_taxa - 1), 0.7 * (n_taxa - 1), 0.6 * (n_taxa - 1))
+  names(cut_off) = c("detected_0.9", "detected_0.8", "detected_0.7", "detected_0.6")
+  
+  # Annotation data
+  
+  
+  detected_sp_index <- which(res$out$detected_0.9 == TRUE)
+  detected_species <-  res$out$taxa_id[detected_sp_index]
+  extract_clr<- res$fig$data$x[detected_sp_index]
+  detected_W <- res$out$W[detected_sp_index]
+  
+  color_list <- ifelse(extract_clr > 0, "Low", 
+                       ifelse(extract_clr < 0, "High", "not_used"))
+  
+  
+  dat_ann = data.frame(x = min(res$fig$data$x), y = cut_off["detected_0.9"], label = "W[0.9]")
+  dat_sp_id = data.frame(x = extract_clr, y = detected_W , label = detected_species, Group = color_list)
+  
+  fig = res$fig + 
+    geom_hline(yintercept = cut_off["detected_0.9"], linetype = "dashed") + 
+    geom_text(data = dat_ann, aes(x = x, y = y, label = label), 
+              size = 4, vjust = -0.5, hjust = 0, color = "orange", parse = TRUE) +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+     geom_text(
+       data = dat_sp_id,
+       aes(x = x, y = y, label = label),
+       size = 2,
+      box.padding = 0.5,  # Adjust as needed to control label positioning
+       color = "black"
+    ) +  geom_vline(xintercept = 0, linetype = "dashed") 
+    
+    
+  fig <- fig + theme(panel.grid = element_blank())
+  filepath = paste0(path_to_save, "ancomb_w_statistic",state,"_plot.jpeg")
+  ggsave(filepath, fig, device = "jpeg", width = 8, height = 6, units = "in")
+
+  
+  # Assuming dat_sp_id is your data frame containing clr values, species names, and colors
+
+  # Select top 230 extreme species based on absolute clr values
+  top_extreme_species <- dat_sp_id[order(abs(dat_sp_id$y)), ][1:length(dat_sp_id$label), ]
+  top_extreme_species <- top_extreme_species[(abs(top_extreme_species$x) > 0), ]
+  top_extreme_species$label <- str_replace(top_extreme_species$label, "_", " ")
+
+  
+  # Define a binary color palette with different colors
+  binary_palette <- c("#00AED7","#FD9347") #Orange and Blue
+  
+  # Set the size for species labels and y-axis text
+clr_plot <- ggplot(top_extreme_species, aes(x = x, y = reorder(label, x), fill = Group)) +
+  geom_bar(stat = "identity", width = 0.7) +  # Adjust width for spacing
+  scale_fill_manual(values = binary_palette) +  # Use the binary color palette
+  labs(x = "CLR Mean Difference", y = "Species") +
+  ggtitle("") +
+  theme_minimal() +  # Minimalist theme
+  theme(panel.grid = element_blank(),  # Remove background grid
+        axis.text.y = element_text(size = 12),  # Adjust y-axis text size
+        axis.text.x = element_text(size = 14),
+        axis.title = element_text(size = 14),# Adjust x-axis text size
+        axis.ticks.x = element_line(size = 0.2),  # Adjust x-axis tick size
+        plot.margin = margin(10, 50, 10, 30, "pt"))  # Adjust plot margins to increase spacing between species names
+
+  # Print the plot
+  print(clr_plot)
+  filepath = paste0(path_to_save, "ancomb_clr_species",state,"_plot.pdf")
+  ggsave(filepath, clr_plot, device = "pdf",width = 8, height = 6, units = "in", dpi = 300)
+  
+  return(top_extreme_species)
+
+}
+
+```
+
+#Survival analysis across all cancer types
+```{r}
+#### Directory path  to change 
+
+survial_analysis <- function(cancer_name,state,path_to_save,metadata){
+PATH="/Users/eemanabbasi/Desktop/paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/"
+
+DATA=paste0(PATH,"survival/data/",sep="")
+RESULTS=paste0(PATH,"survival/results/",sep="")
+SCRIPTS=paste0(PATH,"survival/scripts/",sep="")
+
+clinical_filename="TCGA-CDR-CELL-2018.txt" 
+copynumber_signature_exposures_filename="exposure_counts.txt"
+
+clinical = read.delim(paste0(DATA,clinical_filename, sep=""), sep="\t")
+metadata = metadata
+metadata['bcr_patient_barcode'] = str_sub(metadata$tcga_sample_id,0,12)
+df = merge(clinical, metadata, on='bcr_patient_barcode')
+
+
+print(dim(clinical))
+print(dim(metadata))
+
+#out_counts <- filt_clr_ps$ps_tumor_raw@otu_table
+#sd_counts <- out_counts["Shewanella_decolorationis",]
+
+#immune_data <- up_immune_stad
+#hamp_counts<- immune_data[,"JAK2"]
+#hamp_counts <- as.data.frame(hamp_counts)
+
+#df <- df[df$SampleID %in% rownames(hamp_counts), ]
+#filt_hamp <- hamp_counts[df$SampleID,]
+
+
+#sd_counts <- t(sd_counts)
+#sd_counts <- as.data.frame(sd_counts)
+#filt_sd_counts <- sd_counts[df$SampleID,]
+
+
+#threshold <- median(filt_sd_counts)  # You can adjust this threshold as needed
+#df$SD <- ifelse(filt_sd_counts > threshold, "High", "Low")
+
+
+data <- df
+print(dim(data)) 
+
+keep_pats <- which((data$DSS != "#N/A" & data$DSS.time != "#N/A"))
+data <- data[keep_pats,]
+
+data <- data[complete.cases(data$Subtype), ]
+data <- data[data$Subtype != "STAD_POLE", ]
+data <- data[data$Subtype != "STAD_EBV", ]
+  
+data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+surv_object <- Surv(as.numeric(data$DSS.time), event = data$status)
+print(head(data$Group))
+print(head(data$DSS.time))
+
+data  = within(data,{Group <- relevel(as.factor(Group), ref = "Low")},
+               {Subtpe <- relevel(as.factor(Subtype), ref = "STAD_CIN")})
+#data  = within(data,{Group <- relevel(as.factor(Group), ref = "Low")})
+#data = na.omit(data)
+fit_cox <- coxph(Surv(as.numeric(data$DSS.time), event = data$status) ~  Group + age_at_diagnosis + gender + Subtype, data = data)
+summary_cox <- summary(fit_cox)
+
+
+if (nrow(data) != 0) {
+  
+  fit1 <- survfit(surv_object ~ Group, data = data)
+  
+  # Compute p-values
+  surv_diff_test <- survdiff(surv_object ~ Group , data = data)
+  p_values <- p.adjust(surv_diff_test$pchisq, method = "fdr")
+  
+  # Create a ggsurvplot
+  plot <- ggsurvplot(
+    fit1,
+    data = data,
+    size = 0.5,
+    palette = c("#1f78b4", "#a6cee3", "#ff7f00", "#fdbf6f","#6a3d9a"),
+    conf.int = FALSE,
+    pval = TRUE,
+    pval.method = TRUE,
+    pval.size = 4,
+    pval.adjust.method = "fdr",
+    risk.table = TRUE,
+    risk.table.col = "black",
+    risk.table.title = "",
+    legend.title = "",
+    risk.table.height = 0.26,
+    risk.table.fontsize = 3,
+    risk.table.y.text = FALSE,
+    title = paste0(tissues[i], sep = "")
+  )
+  
+  # Create a text annotation
+  annotation <- geom_text(
+    aes(x = 0.5, y = 0.2, label = paste("FDR p-value =", round(p_values, 3))),
+    size = 3,
+    box.padding = 0.5,
+    direction = "both"
+  )
+
+  
+  # Wrap the plot and annotation in a list
+  #print(list(plot,annotation))
+  plot_list <- plot
+
+  #print(plot_list)
+  
+  
+}
+#plot_with_annotation <- plot + annotation
+  
+# Save the plot as a jpeg file
+jpeg(file = paste0(path_to_save, "surv_", cancer_name, "_", state, "_plot.jpeg"), width = 8, height = 6, units = "in", res = 300)
+print(plot)
+dev.off()
+
+# Save the hazard ratio plot as a jpeg file
+#summary_fit <- summary(fit_cox)
+#hazard_plot <- ggforest(fit_cox, data = data)
+#jpeg(file = paste0(path_to_save, "hazard_ratio_", cancer_name, "_", state, "_plot.jpeg"), width = 8, height = 6, units = "in", res = 300)
+#print(hazard_plot)
+#dev.off()
+
+}
+```
+
+
+```{r}
+
+library(ggplot2)
+
+rank_abundance <- function(ps_tumor_filtered, path_to_save){
+  # Assuming filt_clr_ps$ps_tumor_filtered contains OTU counts, tax table, and metadata
+  # Extract necessary components
+  
+  otu_counts <- ps_tumor_filtered@otu_table
+  tax_table <- ps_tumor_filtered@tax_table
+  metadata <- ps_tumor_filtered@sam_data
+  
+  low_group_species <- rownames(metadata[metadata$Group == "Low"])
+  otu_counts_low <- otu_counts[,low_group_species]/length(low_group_species)
+  
+  high_group_species <- rownames(metadata[metadata$Group == "High"])
+  otu_counts_high <- otu_counts[,high_group_species]/length(high_group_species)
+  
+  
+  # Function to calculate rank abundance for a single sample
+  calculate_rank_abundance <- function(sample_data) {
+    row_sums <- rowSums(sample_data)
+    sorted_counts <- sort(row_sums, decreasing = TRUE)
+    rank_abundance <- data.frame(rank = 1:length(row_sums), abundance = sorted_counts)
+    return(rank_abundance)
+  }
+  
+  # Calculate rank abundance for each sample in the low and high groups
+  rank_abundances_low <- lapply(low_group_species, function(sample_name) {
+    sample_data <- otu_counts[, sample_name]
+    calculate_rank_abundance(sample_data)
+  })
+  rank_abundances_high <- lapply(high_group_species, function(sample_name) {
+    sample_data <- otu_counts[, sample_name]
+    calculate_rank_abundance(sample_data)
+  })
+  
+  # Combine rank abundance data frames for each group
+  df_low <- do.call(rbind, rank_abundances_low)
+  df_low$Group <- "Low"
+  df_high <- do.call(rbind, rank_abundances_high)
+  df_high$Group <- "High"
+  df_combined <- rbind(df_low, df_high)
+  
+  # Remove rows with zero counts for both low and high groups
+  df_combined_filtered <- df_combined[df_combined$abundance != 0, ]
+  
+  # Calculate average abundance at each rank for low and high groups
+  avg_abundance_low <- df_combined_filtered[df_combined_filtered$Group == "Low", ] %>%
+    group_by(rank) %>%
+    dplyr::summarize(avg_abundance = mean(abundance))
+  
+  avg_abundance_high <- df_combined_filtered[df_combined_filtered$Group == "High", ] %>%
+    group_by(rank) %>%
+    dplyr::summarize(avg_abundance = mean(abundance))
+  
+  # Define a custom color palette with lightred
+  custom_palette <- c("Low" = "#FF7F0E", "High" = "#1F77B4")  # Using lightred instead of red
+  
+  # Plot rank abundance curves for both groups with different line styles and average lines
+  rank_plot <- ggplot(df_combined_filtered, aes(x = rank, y = log10(abundance), color = Group, linetype = Group)) +
+  geom_line(alpha = 0.3) +  # Set transparency to 70%
+  geom_line(data = avg_abundance_low, aes(y = log10(avg_abundance)), color = "#FF7F0E", linetype = "solid", size = 1) +  # Add average line for low samples
+  geom_line(data = avg_abundance_high, aes(y = log10(avg_abundance)), color = "#1F77B4", linetype = "solid" , size = 1) +
+  scale_color_manual(name = "Group", values = c("Low" = "#FF7F0E", "High" = "#1F77B4")) +
+  scale_linetype_manual(name = "Group", values = c("Low" = "solid", "High" = "solid")) +  # Use dotted line for low samples and dashed line for high samples
+  scale_x_continuous(name = "Rank") +
+  scale_y_continuous(name = "log(Abundance)") +
+  ggtitle("") +
+  theme_classic() +  
+  theme(
+    legend.position = "bottom",  
+    legend.title = element_text(size = 12, face = "bold"),  
+    legend.text = element_text(size = 10),  
+    plot.title = element_text(size = 14, face = "bold"),  
+    axis.title.x = element_text(size = 12),  # Adjust x-axis title text size
+    axis.title.y = element_text(size = 12),  # Adjust y-axis title text size
+    axis.text = element_text(size = 10),
+    plot.margin = margin(10, 50, 10, 30, "pt")  # Adjust plot margins
+  ) + 
+  guides(color = guide_legend(override.aes = list(alpha = 1)))  # Ensure legend lines are visible
+
+
+  filepath = paste0(path_to_save, "rank_aund",cancer_name,"_",state,"_plot.pdf")
+  ggsave(filepath, rank_plot, device = "pdf",width = 8, height = 6, units = "in", dpi = 300)
+  return(df_combined_filtered)
+
+}
+```
+
+
+#Immune analysis across cancer types 
+```{r}
+# Get unique aliquot IDs from metadata
+unique_aliquot_ids_metadata <- unique(filt_clr_ps$ps_tumor_filtered@sam_data$tcga_aliquot_id)
+
+# Get unique sample IDs from gene expression data
+unique_sample_ids_expression <- unique(expression_stad$sample_id)
+
+# Match samples without duplicates
+match_sampleids <- which(unique_aliquot_ids_metadata %in% unique_sample_ids_expression)
+
+# Filter expression data to keep only matched samples
+filtered_expression_stad <- expression_stad[match_sampleids, ]
+rownames(filtered_expression_stad) <- rownames(filt_clr_ps$ps_tumor_filtered@sam_data) [match_sampleids]
+filtered_expression_stad <- filtered_expression_stad[, -which(colnames(filtered_expression_stad) == "patient_id")]
+filtered_expression_stad <- filtered_expression_stad[, -which(colnames(filtered_expression_stad) == "sample_id")]
+
+
+# Use only matched unique aliquot IDs for setting up colData
+unique_aliquot_ids_matched <- unique_aliquot_ids_metadata[match_sampleids]
+
+# Create colData data frame with group membership and set row names
+group_membership <- filt_clr_ps$ps_tumor_filtered@sam_data$Group[match_sampleids]
+colData <- data.frame(Group = group_membership)
+colData$Group <- factor(colData$Group)
+rownames(colData) <- rownames(filtered_expression_stad)
+#filtered_expression_stad_cleaned <- filtered_expression_stad[, colSums(is.na(filtered_expression_stad)) == 0]
+filtered_expression_stad_cleaned <- filtered_expression_stad[, colSums(is.na(filtered_expression_stad)) < nrow(filtered_expression_stad)]
+filtered_expression_stad_cleaned[is.na(filtered_expression_stad_cleaned)] <- 0
+filtered_expression_stad_cleaned <- filtered_expression_stad_cleaned + abs(min(filtered_expression_stad_cleaned)) + 1
+#filtered_expression_stad_cleaned <- filtered_expression_stad_cleaned + abs(min(filtered_expression_stad_cleaned)) + 1
+filtered_expression_stad_cleaned <- round(filtered_expression_stad_cleaned)
+
+```
+
+
+
+```{r}
+curve_difference <- function(df,
+                             time.var = NULL,
+                             species.var,
+                             abundance.var,
+                             replicate.var,
+                             treatment.var = NULL,
+                             pool = FALSE,
+                             block.var = NULL,
+                             reference.treatment = NULL) {
+
+  # validate function call and purge extraneous columns
+  args <- as.list(match.call()[-1])
+  df <- do.call(check_args, args, envir = parent.frame())
+
+  if (pool) {
+    #add zero abundnaces for missing species to get averages
+    if (!is.null(time.var)) {
+      df <- df[order(df[[time.var]]), ]
+    }
+    by <- c(time.var)
+    allsp <- split_apply_combine(df, by, FUN = fill_zeros,
+      species.var, abundance.var)
+
+    # specify aggregate formula from arguments
+    by <- c(species.var, treatment.var, time.var)
+    spave <- aggregate.data.frame(allsp[abundance.var], allsp[by], FUN = mean)
+    spave <- spave[spave[[abundance.var]] != 0, ]
+
+    # rank each species by treatment and optionally time
+    by <- c(treatment.var, time.var)
+    rankabunddf <- split_apply_combine(spave, by, FUN = add_rank_abundance,
+      species.var, abundance.var)
+  } else {
+    #for block samples
+    by <- c(block.var, replicate.var, time.var)
+    rankabunddf <- split_apply_combine(df, by, FUN = add_rank_abundance,
+        species.var, abundance.var)
+  }
+
+  # specify which variable to use for comparison/"cross join"
+  if (!is.null(block.var)) {
+    cross.var <- treatment.var
+  } else if (pool) {
+    cross.var <- treatment.var
+  } else {
+    cross.var <- replicate.var
+  }
+
+  # order cross.var if unordered factor
+  to_ordered = is.factor(rankabunddf[[cross.var]]) &
+    !is.ordered(rankabunddf[[cross.var]]) &
+    is.null(reference.treatment)
+  if (to_ordered) {
+    class(rankabunddf[[cross.var]]) <- c('ordered', class(rankabunddf[[cross.var]]))
+  }
+
+  # cross join for pairwise comparisons
+  split_by <- c(block.var, time.var)
+  merge_to <- !(names(rankabunddf) %in% split_by)
+  cross.var2 <- paste(cross.var, 2, sep = '')
+  if (is.null(reference.treatment)) {
+    output <- split_apply_combine(rankabunddf, split_by, FUN = function(x) {
+      y <- x[merge_to]
+      cross <- merge(x, y, by = NULL, suffixes = c('', '2'))
+      idx <- cross[[cross.var]] < cross[[cross.var2]]
+      cross[idx, ]
+    })
+  } else {
+    output <- split_apply_combine(rankabunddf, split_by, FUN = function(x) {
+      y <- x[x[[treatment.var]] != reference.treatment, merge_to]
+      x <- x[x[[treatment.var]] == reference.treatment, ]
+      merge(x, y, by = NULL, suffixes = c('', '2'))
+    })
+  }
+
+  # unorder cross.var if orginally unordered factor
+  if (to_ordered) {
+    x <- class(output[[cross.var]])
+    class(output[[cross.var]]) <- x[x != 'ordered']
+    class(output[[cross.var2]]) <- x[x != 'ordered']
+  }
+
+  # split on treatment pairs (and block if not null)
+  output[['curve_diff']] <- mapply(curve_dissim,
+    output[['rankabund']], output[['rankabund2']])
+
+  output_order <- c(
+    time.var,
+    block.var,
+    replicate.var, paste(replicate.var, 2, sep = ''),
+    treatment.var, paste(treatment.var, 2, sep = ''),
+    'curve_diff')
+  return(output[intersect(output_order, names(output))])
+
+}
+```
+
+
+
+
+
+
+```{r}
+# Define a list of tissues
+tissues <- c("TCGA-STAD")
+
+for (cancer_name in tissues) {
+  cancer_name = "TCGA-STAD"
+  state <- "Tumor"
+  path_to_save <- "/Users/eemanabbasi/Desktop/Paper_2/Manuscript_plots/abundance_only/"
+  
+  # Perform analysis for the current tissue
+  output <- get_samples(cancer_name, state)
+  tcga_sample_id <- output$filtered_samples.tcga_aliquot_id
+  #clr_ps <- normalize_ps(output$ps_tumor)
+  cov_ps <- normalize_ps_coverage(output$ps_tumor)
+  plot_data <- plot_data_df(cov_ps)
+  as_out <- assign_groups_richness_abundance(plot_data$plot_data,plot_data$ps_clr)
+  filt_clr_ps <- filtered_ps(as_out$ps_tumor_clr,output$ps_tumor_raw)
+  filt_plot_data <- plot_data_df(filt_clr_ps$ps_tumor_filtered)
+  metadata <- data.frame((filt_clr_ps$ps_tumor_filtered@sam_data))
+  #metadata <- data.frame((plot_data$ps_clr@sam_data))
+  file_name = paste0(path_to_save,"metadata_", cancer_name, ".txt")
+  write.table(metadata, file = file_name, sep = "\t", quote = FALSE, row.names = TRUE)
+  #generate_richness_abundance_plots(cancer_name, state, path_to_save)
+  #rank_df = rank_abundance(filt_clr_ps$ps_tumor_filtered, path_to_save)
+  #run_ancomb(filt_clr_ps$ps_tumor_raw,cancer_name,state,path_to_save)
+  
+  #make high and low phyloseq objects for co-occurance analyses 
+  ps_high <- subset_samples(filt_clr_ps$ps_tumor_filtered, Group == "High")
+  ps_low <- subset_samples(filt_clr_ps$ps_tumor_filtered, Group == "Low")
+
+
+  #survial_analysis(cancer_name,state,path_to_save,metadata)
+  #Survival Code:
+  PATH="/Users/eemanabbasi/Desktop/paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/"
+
+  DATA=paste0(PATH,"survival/data/",sep="")
+  RESULTS=paste0(PATH,"survival/results/",sep="")
+  SCRIPTS=paste0(PATH,"survival/scripts/",sep="")
+  
+  clinical_filename="TCGA-CDR-CELL-2018.txt" 
+  copynumber_signature_exposures_filename="exposure_counts.txt"
+  
+  clinical = read.delim(paste0(DATA,clinical_filename, sep=""), sep="\t")
+  metadata = metadata
+  metadata['bcr_patient_barcode'] = str_sub(metadata$tcga_sample_id,0,12)
+  df = merge(clinical, metadata, on='bcr_patient_barcode')
+  
+  
+  print(dim(clinical))
+  print(dim(metadata))
+  
+  #out_counts <- filt_clr_ps$ps_tumor_raw@otu_table
+  #sd_counts <- out_counts["Shewanella_decolorationis",]
+  
+  #immune_data <- up_immune_stad
+  #hamp_counts<- immune_data[,"JAK2"]
+  #hamp_counts <- as.data.frame(hamp_counts)
+  
+  #df <- df[df$SampleID %in% rownames(hamp_counts), ]
+  #filt_hamp <- hamp_counts[df$SampleID,]
+  
+  
+  #sd_counts <- t(sd_counts)
+  #sd_counts <- as.data.frame(sd_counts)
+  #filt_sd_counts <- sd_counts[df$SampleID,]
+  
+  
+  #threshold <- median(filt_sd_counts)  # You can adjust this threshold as needed
+  #df$SD <- ifelse(filt_sd_counts > threshold, "High", "Low")
+  
+  
+  data <- df
+  
+  
+  print(dim(data)) 
+  
+  keep_pats <- which((data$DSS != "#N/A" & data$DSS.time != "#N/A"))
+  data <- data[keep_pats,]
+  
+
+ 
+  data <- data[complete.cases(data$Subtype), ]
+  data <- data[data$Subtype != "STAD_POLE", ]
+  data <- data[data$Subtype != "STAD_EBV", ]
+    
+  data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+  surv_object <- Surv(as.numeric(data$DSS.time), event = data$status)
+  
+  starting_values <- list(a = 1, b = 1)
+
+  #Non_linear releationship
+  nonlinear_model <- nls(as.numeric(DSS.time) ~ a * microbiome_abundance + b * microbiome_richness,
+                       data = data,
+                       start = list(a = 1, b = 1))
+
+  # View summary of the nonlinear model
+  summary(nonlinear_model)
+  
+  
+  data  = within(data,{Group <- relevel(as.factor(Group), ref = "Low")},
+                 {Subtpe <- relevel(as.factor(Subtype), ref = "STAD_CIN")})
+  #data  = within(data,{Group <- relevel(as.factor(Group), ref = "Low")})
+  #data = na.omit(data)
+  
+  #data$Group <- relevel(as.factor(data$Group), ref = "Low")
+  #data$Subtype <- relevel(as.factor(data$Subtype), ref = "STAD_CIN")
+  fit_cox <- coxph(Surv(as.numeric(data$DSS.time), event = data$status) ~  Group + age_at_diagnosis + Subtype + gender, data = data)
+  summary_cox <- summary(fit_cox)
+  
+  
+  if (nrow(data) != 0) {
+    
+    fit1 <- survfit(surv_object ~ Group, data = data)
+    
+    # Compute p-values
+    surv_diff_test <- survdiff(surv_object ~ Group , data = data)
+    p_values <- p.adjust(surv_diff_test$pchisq, method = "fdr")
+    
+    # Create a ggsurvplot
+    plot <- ggsurvplot(
+      fit1,
+      data = data,
+      size = 0.5,
+      palette = c("#FF7F0E","#1F77B4"),
+      conf.int = FALSE,
+      pval = TRUE,
+      pval.method = TRUE,
+      pval.size = 4,
+      pval.adjust.method = "fdr",
+      risk.table = TRUE,
+      risk.table.col = "black",
+      risk.table.title = "",
+      legend.title = "",
+      risk.table.height = 0.26,
+      risk.table.fontsize = 3,
+      risk.table.y.text = FALSE
+    )
+    
+    # Create a text annotation
+    annotation <- geom_text(
+      aes(x = 0.5, y = 0.2, label = paste("FDR p-value =", round(p_values, 3))),
+      size = 3,
+      box.padding = 0.5,
+      direction = "both"
+    )
+  
+    
+    # Wrap the plot and annotation in a list
+    #print(list(plot,annotation))
+    plot_list <- plot
+  
+    #print(plot_list)
+    
+    
+  }
+  #plot_with_annotation <- plot + annotation
+    
+  # Save the plot as a jpeg file
+  pdf(file = paste0(path_to_save, "surv_", cancer_name, "_", state, "_plot.pdf"))
+  print(plot)
+  dev.off()
+  print("**************************************************************************************************************************")
+
+}
+
+
+```
+
+
+
+
+
+```{r}
+library(tidyverse)  # For data manipulation
+library(caret)      # For model training and evaluation
+data = df
+
+keep_pats <- which((data$DSS != "#N/A" & data$DSS.time != "#N/A" & data$tumor_status != "#N/A"))
+data <- data[keep_pats,]
+
+ 
+data <- data[complete.cases(data$Subtype), ]
+data <- data[complete.cases(data$tumor_status), ]
+
+
+data <- data[data$Subtype != "STAD_POLE", ]
+data <- data[data$Subtype != "STAD_EBV", ]
+data <- data[data$tumor_status != "[Discrepancy]", ]
+
+
+data$DSS_time <- as.numeric(data$DSS.time)
+
+# Subset data to include only observations within the first 5 years
+data_subset <- data
+
+# Determine survival status based on DSS time
+# Convert "WITH TUMOR" to 0, "TUMOR FREE" to 1, and leave NA as NA
+data_subset$status <- ifelse(data_subset$tumor_status == "TUMOR FREE", 1, 
+                              ifelse(data_subset$tumor_status == "WITH TUMOR", 0, 
+                                     NA))
+
+# Fit logistic regression model using the subsetted data
+logit_model_richness <- glm( status ~ microbiome_richness, 
+                    data = data_subset, 
+                    family = binomial(link = "logit"))
+
+logit_model_abundance <- glm(status ~ microbiome_abundance, 
+                    data = data_subset, 
+                    family = binomial(link = "logit"))
+
+logit_model_age <- glm(status ~ initial_pathologic_dx_year, 
+                    data = data_subset, 
+                    family = binomial(link = "logit"))
+
+logit_model_age_diagnosis <- glm(status ~ age_at_diagnosis, 
+                    data = data_subset, 
+                    family = binomial(link = "logit"))
+
+
+# Generate a sequence of values for microbiome_richness
+microbiome_seq <- seq(min(data_subset$microbiome_abundance), max(data_subset$microbiome_abundance), length.out = 1000)
+
+# Calculate the predicted probabilities
+predicted_probabilities <- predict(logit_model_abundance, newdata = data.frame(microbiome_abundance = microbiome_seq), type = "response")
+
+# Plot the logistic curve
+plot(data_subset$microbiome_abundance, data_subset$status, xlab = "Microbiome Abundance", ylab = "Status (0 = With Tumor, 1 = Tumor Free)", pch = 16)
+lines(microbiome_seq, predicted_probabilities, col = "red", type = "l")
+
+
+
+
+
+```
+```{r}
+# Extract coefficients and p-values for each model
+coef_summary_richness <- summary(logit_model_richness)$coefficients[, c("Estimate", "Pr(>|z|)")]
+coef_summary_abundance <- summary(logit_model_abundance)$coefficients[, c("Estimate", "Pr(>|z|)")]
+coef_summary_age_diagnosis <- summary(logit_model_age_diagnosis)$coefficients[, c("Estimate", "Pr(>|z|)")]
+
+# Combine coefficients and p-values into a single dataframe
+coef_summary <- data.frame(
+  Model = c("Richness", "Abundance", "Age at Diagnosis"),
+  Estimate = c(coef_summary_richness["microbiome_richness", "Estimate"],
+               coef_summary_abundance["microbiome_abundance", "Estimate"],
+               coef_summary_age_diagnosis["age_at_diagnosis", "Estimate"]),
+  Odds_Ratio = c(exp(coef_summary_richness["microbiome_richness", "Estimate"]),
+                  exp(coef_summary_abundance["microbiome_abundance", "Estimate"]),
+                  exp(coef_summary_age_diagnosis["age_at_diagnosis", "Estimate"])),
+  P_Value = c(coef_summary_richness["microbiome_richness", "Pr(>|z|)"],
+              coef_summary_abundance["microbiome_abundance", "Pr(>|z|)"],
+              coef_summary_age_diagnosis["age_at_diagnosis", "Pr(>|z|)"])
+)
+
+library(ggplot2)
+
+# Define colors and point size
+point_color <- "black"
+line_color <- "black"
+text_color <- "black"
+dot_size <- 1
+
+odd <- ggplot(coef_summary, aes(x = Model, y = Odds_Ratio, 
+                                ymin = exp(Estimate - 1.96 * sqrt(P_Value)),
+                                ymax = exp(Estimate + 1.96 * sqrt(P_Value)))) +
+  geom_pointrange(color = point_color, size = dot_size) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey") +
+  labs(x = "", y = "Odds Ratio") +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.y = element_text(size = 12, color = text_color),  # Adjust font size and color for y-axis
+        axis.text.x = element_text(size = 12, color = text_color),  # Adjust font size and color for x-axis
+        axis.line = element_blank(),  # Remove axis lines
+        panel.grid.major = element_blank(),  # Remove major grid lines
+        panel.grid.minor = element_blank(),  # Remove minor grid lines
+        plot.title = element_text(size = 16, color = text_color, hjust = 0.5, face = "bold"),  # Title font size, color, and bold
+        plot.subtitle = element_text(size = 14, color = text_color, hjust = 0.5),  # Subtitle font size and color
+        plot.caption = element_text(size = 10, color = text_color, hjust = 1),  # Caption font size and color
+        axis.title.y = element_text(size = 14, color = text_color),  # Y-axis title font size and color
+        axis.title.x = element_text(size = 14, color = text_color),  # X-axis title font size and color
+        plot.background = element_rect(fill = "white", color = NA),  # Plot background color
+        panel.background = element_rect(fill = "white", color = NA),  # Panel background color
+        panel.border = element_blank()) +  # Remove panel border
+  geom_text(aes(label = format(P_Value, scientific = TRUE)),
+            hjust = -0.1, vjust = -0.5, size = 3, color = text_color) +
+  coord_flip() +
+  annotate("text", x = 0.60, y = 0.8, label = "With Tumor", size = 5, hjust = 0.5, color = "black") +
+  annotate("text", x = 0.6, y = 1.2, label = "Tumor Free", size = 5, hjust = 0.5, color = "black")
+
+print(odd)
+ggsave(paste0(path_to_save,"odd_tumor_status.pdf"), odd, width = 8, height = 6, units = "in", dpi = 300)
+
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Extract abundance matrix from the phyloseq object
+abundance_matrix <- as(t(otu_table(output$ps_tumor_raw)), "matrix")
+
+# Perform PCA
+pca_result <- prcomp(abundance_matrix, scale. = TRUE)
+
+# Extract PCA scores
+pca_scores <- as.data.frame(pca_result$x[, 1:2])  # Keep first two principal components for 2D plot
+
+# Extract sample metadata
+sample_data <- as.data.frame(sample_data(output$ps_tumor_raw))
+
+# Combine PCA scores with sample metadata
+pca_data <- cbind(pca_scores, sample_data)
+
+# Create separate data frames for experimental strategy and data submitting center
+experimental_strategy_data <- pca_data %>%
+  filter(!is.na(experimental_strategy))
+
+data_submitting_center_data <- pca_data %>%
+  filter(!is.na(data_submitting_center_label))
+
+# Create 2D PCA plots for experimental strategy and data submitting center
+pca_plot_strategy <- ggplot(experimental_strategy_data, aes(x = PC1, y = PC2, color = experimental_strategy)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(x = "PC1", y = "PC2", color = "Experimental Strategy") +
+  scale_color_manual(values = c("RNA-Seq" = "red", "WGS" = "blue")) +  # Adjust colors as needed
+  theme_minimal() +
+  theme(legend.position = "right", 
+        panel.grid.major = element_blank(),  # Remove major grid lines
+        panel.grid.minor = element_blank()) +
+  theme(legend.position = "right") +  # Adjust legend position as needed
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14), 
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 14))  # Adjust font sizes for publication quality
+
+pca_plot_center <- ggplot(data_submitting_center_data, aes(x = PC1, y = PC2, color = data_submitting_center_label)) +
+  geom_point(size = 3, alpha = 0.7) +
+  labs(x = "PC1", y = "PC2", color = "Data Submitting Center") +
+  theme_minimal() +
+  theme(legend.position = "right", 
+        panel.grid.major = element_blank(),  # Remove major grid lines
+        panel.grid.minor = element_blank()) + # Rem
+  
+  theme(legend.position = "right") +  # Adjust legend position as needed
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14), 
+        legend.text = element_text(size = 12), 
+        legend.title = element_text(size = 14))  # Adjust font sizes for publication quality
+
+# Combine both plots
+combined_pca_plot <- pca_plot_strategy + pca_plot_center + plot_layout(ncol = 2)
+
+# Show the combined plot
+print(combined_pca_plot)
+
+
+# Show the plot
+#print(pca_plot)
+ggsave("/Users/eemanabbasi/Desktop/paper_2/manuscript_plots/batch/combined_pca_plot.jpeg", 
+       combined_pca_plot, 
+       width = 12,  # Adjust width as needed
+       height = 6,  # Adjust height as needed
+       dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(DESeq2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+#Load the data 
+expression_stad <- read.table('/Users/eemanabbasi/Desktop/TCGA.STAD.expression.txt', sep = "\t", check.names = F, header = T) 
+sample_ids <- expression_stad$sample_id
+```
+
+```{r}
+# Get unique aliquot IDs from metadata
+unique_aliquot_ids_metadata <- unique(filt_clr_ps$ps_tumor_filtered@sam_data$tcga_aliquot_id)
+
+# Get unique sample IDs from gene expression data
+unique_sample_ids_expression <- unique(expression_stad$sample_id)
+
+# Match samples without duplicates
+match_sampleids <- which(unique_aliquot_ids_metadata %in% unique_sample_ids_expression)
+
+# Filter expression data to keep only matched samples
+filtered_expression_stad <- expression_stad[match_sampleids, ]
+rownames(filtered_expression_stad) <- rownames(filt_clr_ps$ps_tumor_filtered@sam_data) [match_sampleids]
+filtered_expression_stad <- filtered_expression_stad[, -which(colnames(filtered_expression_stad) == "patient_id")]
+filtered_expression_stad <- filtered_expression_stad[, -which(colnames(filtered_expression_stad) == "sample_id")]
+
+
+# Use only matched unique aliquot IDs for setting up colData
+unique_aliquot_ids_matched <- unique_aliquot_ids_metadata[match_sampleids]
+
+# Create colData data frame with group membership and set row names
+group_membership <- filt_clr_ps$ps_tumor_filtered@sam_data$Group[match_sampleids]
+colData <- data.frame(Group = group_membership)
+colData$Group <- factor(colData$Group)
+rownames(colData) <- rownames(filtered_expression_stad)
+#filtered_expression_stad_cleaned <- filtered_expression_stad[, colSums(is.na(filtered_expression_stad)) == 0]
+filtered_expression_stad_cleaned <- filtered_expression_stad[, colSums(is.na(filtered_expression_stad)) < nrow(filtered_expression_stad)]
+filtered_expression_stad_cleaned[is.na(filtered_expression_stad_cleaned)] <- 0
+filtered_expression_stad_cleaned <- filtered_expression_stad_cleaned + abs(min(filtered_expression_stad_cleaned)) + 1
+#filtered_expression_stad_cleaned <- filtered_expression_stad_cleaned + abs(min(filtered_expression_stad_cleaned)) + 1
+filtered_expression_stad_cleaned <- round(filtered_expression_stad_cleaned)
+```
+
+```{r}
+
+library(edgeR)
+
+
+
+stad_immune <- filtered_expression_stad_cleaned
+colnames(stad_immune) <- sub("\\|.*", "", colnames(stad_immune))
+common_colnames <- intersect(gene_immune_names, colnames(stad_immune))
+immune_stad_filt <- stad_immune[, common_colnames]
+
+# Extract normalized counts
+
+dds <- DESeqDataSetFromMatrix(countData = t(immune_stad_filt),
+                              colData = colData,
+                              design = ~ Group)
+
+
+
+
+counts_matrix <- assay(dds)
+
+num_samples <- ncol(counts_matrix)
+dds <- dds[rowSums(counts(dds)) > 1,]
+
+#threshold <- ceiling(num_samples * 0.1)  # 50% of the samples
+#keep <- rowSums(cpm(counts_matrix) > 1) >= threshold
+#dds <- dds[keep,]
+
+
+
+
+
+
+
+dds$Group <- relevel(dds$Group, ref = "Low")  # Set "High" group as the reference
+dds <- DESeq(dds)
+res <- results(dds)
+
+
+
+library(EnhancedVolcano)
+vol <- EnhancedVolcano::EnhancedVolcano(res, x = "log2FoldChange", y = "padj", lab= rownames(res), pCutoff = 5e-2, FCcutoff = 0.5)
+vol
+ggsave("/Users/eemanabbasi/Desktop/Plots/volcano.jpeg", plot = vol, device = "jpeg",width = 8, height = 7)
+
+#immune_counts <- as.data.frame(t(counts(dds,normalized = T)))
+#DESeq.rlog <- rlog(dds, blind = TRUE)
+#immune_counts_df <- as.data.frame(assay(DESeq.rlog))
+#immune_counts_df <- t(immune_counts_df)
+
+
+immune_counts <- t(as.data.frame(counts(dds, normalized = T)))
+#immune_counts <- log(immune_counts)
+
+#gene_lengths <- rowMeans(counts(dds)) / rowMeans(counts(dds), na.rm = TRUE)
+#cpm <- sweep(counts(dds), 2, colSums(counts(dds)) / 1e6, "/")
+#scaling_factors <- colSums(cpm) / 1e6
+#tpm <- t(t(cpm) / scaling_factors) / gene_lengths
+#tpm_df <- as.data.frame(tpm)
+
+#rownames(tpm_df) <- rownames(counts(dds))
+#colnames(tpm_df) <- colnames(counts(dds))
+#immune_counts <- t(tpm_df)
+
+dds <- calcNormFactors(dds, method = "TMM")
+normalized_counts <- cpm(dds)
+#immune_counts <- t(normalized_counts)
+
+
+
+res$p_log <- -log10(res$padj)
+enriched_indices <- which((res$log2FoldChange > 0.5 | res$log2FoldChange < - 0.5) & res$p_log > 1.30103)
+enriched_genes <- rownames(res)[enriched_indices]
+up_immune_stad <- immune_counts[,enriched_indices]
+up_stad_metadata <- filt_clr_ps$ps_tumor_filtered@sam_data[rownames(up_immune_stad)]
+up_filt_otu <- filt_clr_ps$ps_tumor_filtered@otu_table[,rownames(up_stad_metadata)]
+#up_stad_metadata <- raw_ps@sam_data[rownames(up_immune_stad)]
+
+#up_filt_otu <- raw_ps@otu_table[,rownames(up_stad_metadata)]
+
+group_membership_up <- as.data.frame(up_stad_metadata$Group)
+rownames(group_membership_up) <- rownames(up_stad_metadata)
+
+
+# Step 3: Extract samples for the "high" and "low" groups
+high_samples <- rownames(up_immune_stad[up_stad_metadata$Group == "High", ])
+low_samples <- rownames(up_immune_stad[up_stad_metadata$Group == "Low", ])
+
+sigGenes <- list()
+# Create a directory to save the plots
+
+
+# Loop through each gene
+for (gene in colnames(up_immune_stad)) {
+  # Subset gene expression data for the "High" and "Low" groups
+  high_gene_expression <- up_immune_stad[high_samples, gene]
+  low_gene_expression <- up_immune_stad[low_samples, gene]
+  
+  # Perform statistical test (Wilcoxon rank-sum test) between the groups
+  test_result <- wilcox.test(high_gene_expression, low_gene_expression)
+  
+  # Extract test statistic and p-value
+  test_statistic <- test_result$statistic
+  p_value <- test_result$p.value
+  adjusted_p_values <- p.adjust(p_value, method = "fdr")
+
+  
+  # Create data frame for plotting
+  gene_data <- data.frame(
+    Expression = c(high_gene_expression, low_gene_expression),
+    Group = factor(rep(c("High", "Low"), c(length(high_gene_expression), length(low_gene_expression))))
+  )
+  
+  # Create transparent box plot with dots on top
+  if (adjusted_p_values < 0.05){
+    
+    # Define file name
+    file_name <- paste0(path_to_save, gene, ".jpeg")
+    
+    # Create plot
+    y <- ggplot(gene_data, aes(x = Group, y = Expression, fill = Group)) +
+      geom_boxplot(alpha = 0.5) +  # Set box plot transparency
+      geom_jitter(width = 0.1, alpha = 0.7, color = "black") +  # Add jittered points on top
+      labs(x = "", y = paste0(gene, " Expression")) +
+      theme_minimal(base_size = 16) +  # Increase base font size
+      theme(axis.line = element_blank(),  # Remove axis lines
+            axis.text.x = element_text(angle = 45, hjust = 1, size = 14),  # Rotate x-axis labels
+            axis.text.y = element_text(size = 14),  # Adjust y-axis label size
+            panel.grid.major = element_blank(),  # Remove major grid lines
+            panel.grid.minor = element_blank(),  # Remove minor grid lines
+            panel.border = element_blank(),  # Remove panel border
+            legend.position = "none") +  # Remove legend
+      scale_fill_manual(values = c("Low" = "#FD9347", "High" = "#00AED7")) +  # Set colors
+      geom_text(aes(x = 1.25, y = max(gene_data$Expression), 
+                    label = paste("p-adj:", signif(adjusted_p_values, digits = 4))),
+                vjust = -0.5, hjust = 0.5, size = 5, color = "black")  # Add adjusted p-value
+    
+    # Print and save plot
+    print(y)
+    ggsave(file_name, plot = y, width = 6, height = 6, dpi = 300)  # Adjust width, height, and dpi for publication quality
+  }
+}
+
+
+```
+
+```{r}
+
+#Coocurrance analysis functions
+cooccur_filter <- function(RA="relative abundance", co_per=0.5){
+  logic_RA=(RA>0)*1
+  filter=(colSums(logic_RA)/nrow(logic_RA))>=co_per
+  filter_RA=RA[,filter]
+  return(filter_RA)
+}
+
+cooccurrence<-function(data ="relative abundance",taxon=NULL,type="sp",cor=0.6,pval=0.01){
+  require(igraph)
+  require(Hmisc)
+  ifelse(type=="sp",corrMatrix <- rcorr(as.matrix(data),type="spearman"),corrMatrix <- rcorr(as.matrix(data),type="pearson"))
+  pAdjusted=p.adjust(corrMatrix$P,method = "BH")
+  corrMatrixMin=(((abs(corrMatrix$r)>cor)*1+(pAdjusted<pval)*1)==2)*1
+  diag(corrMatrixMin)=0
+  corrMatrixTax=corrMatrixMin[rowSums(corrMatrixMin)>1,colSums(corrMatrixMin)>1]
+  #taxon.netw=droplevels(taxon[which(rownames(taxon)%in%gsub("V","",colnames(corrMatrixTax))),])
+  netw.corr=graph.adjacency(corrMatrixMin,mode="undirected",weighted=TRUE)
+  netw.corr.trim=delete_vertices(netw.corr,igraph::degree(netw.corr)<1)
+  taxon.netw <- taxon[which(rownames(taxon)%in%V(netw.corr.trim)$name),]
+
+  return(list("corr"=corrMatrix,"corrMin"=corrMatrixMin,"netw"=netw.corr.trim,"taxon.netw"=taxon.netw,pAdjusted=as.matrix(pAdjusted)))
+}
+
+#filter the data based on high and low samples 
+
+#High = "#00AED7", Low = "#FD9347"
+RA= ps_high@otu_table
+tax_val = ps_high@tax_table
+biom_fil=cooccur_filter(t(RA),co_per=0.5)
+path_to_save <- "/Users/eemanabbasi/Desktop/Paper_2/Manuscript_plots/interaction_potential/"
+
+
+#run co-occurence. Taxon can be excluded and identified later if desired.
+biom_netw=cooccurrence(biom_fil,taxon = tax_val)
+co_occurrence_communities <- cluster_fast_greedy(biom_netw$netw, weights = E(biom_netw$netw)$weight)
+
+pdf(file = paste0(path_to_save,"subcommunity_high.pdf"))
+plot(co_occurrence_communities,biom_netw$netw, vertex.label = NA)
+dev.off()
+
+
+co_occurrence_membership <- membership(co_occurrence_communities)
+
+co_occurrence_df = as.data.frame(cbind(co_occurrence_communities$membership, co_occurrence_communities$names))
+co_occurrence_df 
+
+colnames(co_occurrence_df)<- c("group", "names")
+
+
+##jpeg(file = paste0(path_to_save,"hist_high.pdf"))
+#plot(hist(co_occurrence_df))
+
+co_occurrence_df$group <- as.numeric(co_occurrence_df$group)
+co_occurrence_df$group <- as.factor(co_occurrence_df$group)
+group_counts <- table(co_occurrence_df$group)
+
+
+abundance_data <- as.data.frame(otu_table(ps_low))
+
+# Step 2: Add the 'group' information to the OTU table
+abundance_data$group <- factor(co_occurrence_df$group[match(rownames(abundance_data), co_occurrence_df$names)])
+
+# Step 3: Summarize the abundance by group
+abundance_by_group <- aggregate(abundance_data[, -ncol(abundance_data)], by = list(group = abundance_data$group), FUN = sum)
+
+row_sums <- rowSums(abundance_by_group[, -1])
+group_ids <- abundance_by_group$group
+
+# Plot the row sums
+library(ggplot2)
+
+# Create a data frame from row sums for plotting
+row_sums_df <- data.frame(group = group_ids, Abundance = (row_sums))
+
+#abundance_by_group$Abundance <- as.numeric(abundance_by_group$Abundance)
+
+
+
+pdf(file = paste0(path_to_save,"abundance_low.pdf"))
+barplot((row_sums_df$Abundance), 
+        names.arg = row_sums_df$group,
+        xlab = "Subcommunity ID", 
+        ylab = "Community Abundance", 
+        col = "#FD9347",
+        border = "black",
+        cex.names = 1.5,   # Adjust the size of group names
+        cex.axis = 1.5,    # Adjust the size of axis labels
+        cex.lab = 1.5)
+dev.off()
+
+
+
+pdf(file = paste0(path_to_save,"richness_low.pdf"))
+
+# Create the bar plot with adjusted label size
+barplot(group_counts, 
+        xlab = "Subcommunity ID", 
+        ylab = "Num Species", 
+        col = "#FD9347", 
+        border = "black",
+        cex.names = 1.5,  # Set the size of group names
+        cex.axis = 1.5,   # Set the size of axis labels
+        cex.lab = 1.5)    # Set the size of axis titles and labels
+
+dev.off()
+
+
+
+
+
+co_occurrence_df_1 <- co_occurrence_df[co_occurrence_df$group==15,]
+co_occurrence_df_1_names <- co_occurrence_df_1$names
+
+co_occurrence_df_2 <- co_occurrence_df[co_occurrence_df$group==2,]
+co_occurrence_df_2_names <- co_occurrence_df_2$names
+
+co_occurrence_df_3 <- co_occurrence_df[co_occurrence_df$group==6,]
+co_occurrence_df_3_names <- co_occurrence_df_3$names
+
+co_occurrence_df_4 <- co_occurrence_df[co_occurrence_df$group==10,]
+co_occurrence_df_4_names <- co_occurrence_df_4$names
+
+
+```
+
+
+```{r}
+
+
+# High data
+high_data <- data.frame(
+  Group = rep("High", times = 15),
+  MIP = c(21,15,15,7,8,4,5,3,7,2,1,1,2,6,2),
+  MRO = c(0.593966263, 0.6938557262, 0.6025, 0.7112970711, 0.7447513812, 
+            0.6770833333, 0.6878306878, 0.7658227848, 0.7262787973, 0.7820224719, 
+            0.9, 0.8636363636, 0.9333333333, 0.6315789474, 0.8636363636),
+  ID = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), 
+  abundance <- c(
+    3.652194e-03, 3.131388e-02, 2.401543e-03, 1.229450e-03, 2.211520e-04,
+    1.356086e-04, 3.231543e-04, 2.565585e-01, 1.018266e-03, 2.316345e-05,
+    3.347544e-03, 1.005195e-05, 1.849786e-05, 2.439458e-05, 2.887666e-04
+),richness <- c(33, 37, 26, 9, 11, 4, 5, 14, 4, 6, 2, 2, 2, 2, 2)
+  
+)
+
+
+high_data_abundance <- 
+# Low data
+low_data <- data.frame(
+  Group = rep("Low", times = 2),
+  MIP = c(2,3),
+  MRO = c(0.7466666667,0.7769230769),
+  ID = c(2,1),
+  abundance <- c(6.462793e-06,2.984889e-05),
+   richness = c(4,2)
+)
+
+# Combine high and low data
+competition_data <- rbind(high_data, low_data)
+# Plot
+# Calculate upper and lower bounds for error bars
+average_values <- aggregate(. ~ Group, data = competition_data, FUN = mean)
+sd_values <- aggregate(. ~ Group, data = competition_data, FUN = sd)
+
+# Load necessary libraries
+library(ggplot2)
+library(RColorBrewer)
+
+# Set a high-quality color palette
+palette <- brewer.pal(n = 8, name = "Set1")
+
+comp <- ggplot() +
+  geom_point(data = competition_data, aes(x = MRO, y = MIP, color = Group), size = 8) + # Increased point size
+  geom_text(data = competition_data, aes(x = MRO, y = MIP, label = ID), hjust = 0.5, vjust = 0.5, size = 5, fontface = "bold") + # Making text bold and larger
+  labs(x = "Competition",
+       y = "Mutualism",
+       color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347"), breaks = c("High", "Low")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(comp)
+
+#ggsave(paste0(path_to_save,"MRO_MIP_default.pdf"),comp )
+
+
+avg_values <- aggregate(. ~ Group, data = competition_data, FUN = mean)
+sd_values <- aggregate(. ~ Group, data = competition_data, FUN = sd)
+
+# Plot
+comp_plot <- ggplot(avg_values, aes(x = MRO, y = MIP, color = Group)) +
+  geom_point(size = 3) +
+  labs(x = "Competition", y = "Mutualism", color = "Group") +
+  scale_color_manual(values = c("High" = "#00AED7", "Low" = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+
+print(comp_plot)
+ggsave(paste0(path_to_save,"MRO_MIP_avg_default.pdf"),comp_plot )
+
+
+
+```
+
+```{r}
+# High data
+high_data <- data.frame(
+  Group = rep("High", times = 15),
+  MIP = c(21,15,15,7,8,4,5,3,7,2,1,1,2,6,2),
+  MRO = c(0.593966263, 0.6938557262, 0.6025, 0.7112970711, 0.7447513812, 
+          0.6770833333, 0.6878306878, 0.7658227848, 0.7262787973, 0.7820224719, 
+          0.9, 0.8636363636, 0.9333333333, 0.6315789474, 0.8636363636),
+  ID = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), 
+  abundance = c(
+    3.652194e-03, 3.131388e-02, 2.401543e-03, 1.229450e-03, 2.211520e-04,
+    1.356086e-04, 3.231543e-04, 2.565585e-01, 1.018266e-03, 2.316345e-05,
+    3.347544e-03, 1.005195e-05, 1.849786e-05, 2.439458e-05, 2.887666e-04
+  ),
+  richness = c(33, 37, 26, 9, 11, 4, 5, 14, 4, 6, 2, 2, 2, 2, 2)
+)
+
+# Low data
+low_data <- data.frame(
+  Group = rep("Low", times = 2),
+  MIP = c(2,3),
+  MRO = c(0.7466666667,0.7769230769),
+  ID = c(2,1),
+  abundance = c(6.462793e-06,2.984889e-05),
+  richness = c(4,2)
+)
+
+# Combine high and low data
+competition_data <- rbind(high_data, low_data)
+
+
+# Add a small constant to abundance to avoid log(0)
+
+
+# Load necessary libraries
+library(ggplot2)
+library(RColorBrewer)
+
+# Set a high-quality color palette
+palette <- brewer.pal(n = 8, name = "Set1")
+
+# Plot Abundance vs Mutualism with regression line and point labels
+mutualism_plot_abundance <- ggplot(competition_data, aes(x = MIP, y = log(abundance), color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  labs(x = "Mutualism", y = "log(Abundance)", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(mutualism_plot_abundance)
+ggsave(paste0(path_to_save,"abundance_vs_mutualism.pdf"),mutualism_plot_abundance )
+
+
+# Plot Abundance vs Mutualism with regression line and point labels
+mutualism_plot_richness <- ggplot(competition_data, aes(x = MIP, y = richness, color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  labs(x = "Mutualism", y = "Species Richness", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(mutualism_plot_richness)
+ggsave(paste0(path_to_save,"richness_vs_mutualism.pdf"),mutualism_plot_richness )
+
+
+
+# Plot Abundance vs Competition with regression line and point labels
+competition_plot_abundance <- ggplot(competition_data, aes(x = MRO, y = log(abundance), color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  labs(x = "Competition", y = "log(Abundance)", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+print(competition_plot_abundance)
+ggsave(paste0(path_to_save,"abund_vs_competition.pdf"),competition_plot_abundance )
+
+competition_plot_richness <- ggplot(competition_data, aes(x = MRO, y = richness, color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  labs(x = "Competition", y = "Species Richness", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+
+print(competition_plot_richness)
+ggsave(paste0(path_to_save,"competition_plot_richness.pdf"),competition_plot_richness )
+
+# Statistical analysis: Linear regression
+mutualism_lm <- lm(log(abundance) ~ MIP, data = competition_data)
+competition_lm <- lm(log(abundance) ~ MRO, data = competition_data)
+
+# Print summary of linear regression results
+summary(mutualism_lm)
+summary(competition_lm)
+
+
+
+```
+
+
+```{r}
+# High data
+high_data <- data.frame(
+  Group = rep("High", times = 15),
+  MIP = c(21,15,15,7,8,4,5,3,7,2,1,1,2,6,2),
+  MRO = c(0.593966263, 0.6938557262, 0.6025, 0.7112970711, 0.7447513812, 
+          0.6770833333, 0.6878306878, 0.7658227848, 0.7262787973, 0.7820224719, 
+          0.9, 0.8636363636, 0.9333333333, 0.6315789474, 0.8636363636),
+  ID = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), 
+  abundance = c(
+    3.652194e-03, 3.131388e-02, 2.401543e-03, 1.229450e-03, 2.211520e-04,
+    1.356086e-04, 3.231543e-04, 2.565585e-01, 1.018266e-03, 2.316345e-05,
+    3.347544e-03, 1.005195e-05, 1.849786e-05, 2.439458e-05, 2.887666e-04
+  ),
+  richness = c(33, 37, 26, 9, 11, 4, 5, 14, 4, 6, 2, 2, 2, 2, 2)
+)
+
+# Low data
+low_data <- data.frame(
+  Group = rep("Low", times = 2),
+  MIP = c(2,3),
+  MRO = c(0.7466666667,0.7769230769),
+  ID = c(2,1),
+  abundance = c(6.462793e-06,2.984889e-05),
+  richness = c(4,2)
+)
+
+# Combine high and low data
+competition_data <- rbind(high_data, low_data)
+
+# Load necessary libraries
+library(ggplot2)
+library(RColorBrewer)
+
+# Set a high-quality color palette
+palette <- brewer.pal(n = 8, name = "Set1")
+
+# Statistical analysis: Linear regression
+mutualism_lm_abundance <- lm(log(abundance) ~ MIP, data = competition_data)
+competition_lm_abundance <- lm(log(abundance) ~ MRO, data = competition_data)
+mutualism_lm_richness <- lm(richness ~ MIP, data = competition_data)
+competition_lm_richness <- lm(richness ~ MRO, data = competition_data)
+
+# Extract p-values and R-squared values
+mutualism_abundance_p <- summary(mutualism_lm_abundance)$coefficients[2, 4]
+mutualism_abundance_r2 <- summary(mutualism_lm_abundance)$r.squared
+competition_abundance_p <- summary(competition_lm_abundance)$coefficients[2, 4]
+competition_abundance_r2 <- summary(competition_lm_abundance)$r.squared
+mutualism_richness_p <- summary(mutualism_lm_richness)$coefficients[2, 4]
+mutualism_richness_r2 <- summary(mutualism_lm_richness)$r.squared
+competition_richness_p <- summary(competition_lm_richness)$coefficients[2, 4]
+competition_richness_r2 <- summary(competition_lm_richness)$r.squared
+
+# Plot Abundance vs Mutualism with regression line and point labels
+mutualism_plot_abundance <- ggplot(competition_data, aes(x = MIP, y = log(abundance), color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  annotate("text", x = max(competition_data$MIP), y = min(log(competition_data$abundance)), 
+           label = paste0("p = ", round(mutualism_abundance_p, 4), "\nR² = ", round(mutualism_abundance_r2, 4)), 
+           hjust = 1, vjust = 0, size = 4) +
+  labs(x = "Mutualism", y = "log(Abundance)", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(mutualism_plot_abundance)
+ggsave(paste0(path_to_save,"abundance_vs_mutualism.pdf"), mutualism_plot_abundance)
+
+# Plot Richness vs Mutualism with regression line and point labels
+mutualism_plot_richness <- ggplot(competition_data, aes(x = MIP, y = richness, color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  annotate("text", x = max(competition_data$MIP), y = min(competition_data$richness), 
+           label = paste0("p = ", round(mutualism_richness_p, 4), "\nR² = ", round(mutualism_richness_r2, 4)), 
+           hjust = 1, vjust = 0, size = 4) +
+  labs(x = "Mutualism", y = "Species Richness", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(mutualism_plot_richness)
+ggsave(paste0(path_to_save,"richness_vs_mutualism.pdf"), mutualism_plot_richness)
+
+
+# Plot Abundance vs Competition with regression line and point labels
+competition_plot_abundance <- ggplot(competition_data, aes(x = MRO, y = log(abundance), color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  annotate("text", x = max(competition_data$MRO), y = min(log(competition_data$abundance)), 
+           label = paste0("p = ", round(competition_abundance_p, 4), "\nR² = ", round(competition_abundance_r2, 4)), 
+           hjust = 1, vjust = 0, size = 4) +
+  labs(x = "Competition", y = "log(Abundance)", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(competition_plot_abundance)
+ggsave(paste0(path_to_save,"abund_vs_competition.pdf"), competition_plot_abundance)
+
+# Plot Richness vs Competition with regression line and point labels
+competition_plot_richness <- ggplot(competition_data, aes(x = MRO, y = richness, color = Group)) +
+  geom_point(size = 4, alpha = 0.6) +
+  geom_text(aes(label = ID), hjust = 0.5, vjust = 0.4, size = 3, fontface = "bold") +  # Add IDs to points
+  geom_smooth(method = "lm", se = FALSE, color = "black") +  # Add regression line
+  annotate("text", x = max(competition_data$MRO), y = min(competition_data$richness), 
+           label = paste0("p = ", round(competition_richness_p, 4), "\nR² = ", round(competition_richness_r2, 4)), 
+           hjust = 1, vjust = 0, size = 4) +
+  labs(x = "Competition", y = "Species Richness", color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(competition_plot_richness)
+ggsave(paste0(path_to_save,"competition_plot_richness.pdf"),competition_plot_richness )
+
+```
+
+
+
+
+
+```{r}
+high_data <- data.frame(
+  Group = rep("High", times = 15),
+  MIP = c(21,15,15,7,8,4,5,3,7,2,1,1,2,6,2),
+  MRO = c(0.593966263, 0.6938557262, 0.6025, 0.7112970711, 0.7447513812, 
+          0.6770833333, 0.6878306878, 0.7658227848, 0.7262787973, 0.7820224719, 
+          0.9, 0.8636363636, 0.9333333333, 0.6315789474, 0.8636363636),
+  ID = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), 
+  abundance = c(
+    3.652194e-03, 3.131388e-02, 2.401543e-03, 1.229450e-03, 2.211520e-04,
+    1.356086e-04, 3.231543e-04, 2.565585e-01, 1.018266e-03, 2.316345e-05,
+    3.347544e-03, 1.005195e-05, 1.849786e-05, 2.439458e-05, 2.887666e-04
+  ),
+  richness = c(33, 37, 26, 9, 11, 4, 5, 14, 4, 6, 2, 2, 2, 2, 2)
+)
+
+# Low data
+low_data <- data.frame(
+  Group = rep("Low", times = 2),
+  MIP = c(2,3),
+  MRO = c(0.7466666667,0.7769230769),
+  ID = c(2,1),
+  abundance = c(6.462793e-06,2.984889e-05),
+  richness = c(4,2)
+)
+
+# Combine high and low data
+competition_data <- rbind(high_data, low_data)
+
+
+# Calculate upper and lower bounds for error bars
+average_values <- aggregate(. ~ Group, data = competition_data, FUN = mean)
+sd_values <- aggregate(. ~ Group, data = competition_data, FUN = sd)
+
+# Load necessary libraries
+library(ggplot2)
+library(RColorBrewer)
+
+# Set a high-quality color palette
+palette <- brewer.pal(n = 8, name = "Set1")
+
+comp <- ggplot() +
+  geom_point(data = average_values, aes(x = MRO, y = MIP, color = Group), size = 8) + # Increased point size
+  labs(x = "Competition",
+       y = "Mutualism",
+       color = "Group") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347"), breaks = c("High", "Low")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+print(comp)
+
+ggsave(paste0(path_to_save,"MRO_MIP_default.pdf"),comp )
+```
+
+
+```{r}
+
+
+
+
+# Combine high and low data for M9 and LB
+competition_data_M9 <- rbind(high_data_M9, low_data_M9)
+competition_data_LB <- rbind(high_data_LB, low_data_LB)
+
+# Calculate average values for MRO and MIP for M9 and LB separately
+average_values_M9 <- aggregate(. ~ Group, data = competition_data_M9, FUN = mean)
+average_values_LB <- aggregate(. ~ Group, data = competition_data_LB, FUN = mean)
+
+# Add a column to differentiate the media
+average_values_M9$Media <- "M9"
+average_values_LB$Media <- "LB"
+
+# Combine average values for plotting
+average_values <- rbind(average_values_M9, average_values_LB)
+
+# Plot
+library(ggplot2)
+library(RColorBrewer)
+
+palette <- brewer.pal(n = 8, name = "Set1")
+
+comp <- ggplot() +
+  geom_point(data = average_values, aes(x = MRO, y = MIP, color = Group, shape = Media), size = 6) +
+  labs(x = "Competition",
+       y = "Mutualism",
+       color = "Group",
+       shape = "Media") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347"), breaks = c("High", "Low")) +
+  scale_shape_manual(values = c(M9 = 16, LB = 17)) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 16),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))+
+    scale_x_continuous(limits = c(0.68, 0.86))
+
+```
+
+```{r}
+# High and low data for M9
+high_data_M9 <- data.frame(
+  Group = rep("High", times = 4),
+  MIP = c(3, 5, 3, 2),
+  MRO = c(0.7628108108, 0.748980632, 0.7531944688, 0.7595604396),
+  ID = c(2, 3, 1, 8)
+)
+
+low_data_M9 <- data.frame(
+  Group = rep("Low", times = 2),
+  MIP = c(4, 2),
+  MRO = c(0.7583333333, 0.8165374677),
+  ID = c(2, 1)
+)
+
+# High and low data for LB
+high_data_LB <- data.frame(
+  Group = rep("High", times = 4),
+  MIP = c(10, 14, 21, 3),
+  MRO = c(0.7407484407, 0.6307439825, 0.6108758486, 0.7534303534),
+  ID = c(2, 3, 1, 8)
+)
+
+low_data_LB <- data.frame(
+  Group = rep("Low", times = 2),
+  MIP = c(2, 3),
+  MRO = c(0.8524590164, 0.8333333333),
+  ID = c(2, 1)
+)
+
+# Combine high and low data for M9 and LB
+competition_data_M9 <- rbind(high_data_M9, low_data_M9)
+competition_data_LB <- rbind(high_data_LB, low_data_LB)
+
+# Calculate average values for MRO and MIP for M9 and LB separately
+average_values_M9 <- aggregate(. ~ Group, data = competition_data_M9, FUN = mean)
+average_values_LB <- aggregate(. ~ Group, data = competition_data_LB, FUN = mean)
+
+# Add a column to differentiate the media
+average_values_M9$Media <- "M9"
+average_values_LB$Media <- "LB"
+
+# Combine average values for plotting
+average_values <- rbind(average_values_M9, average_values_LB)
+
+# Plot
+library(ggplot2)
+library(RColorBrewer)
+
+palette <- brewer.pal(n = 8, name = "Set1")
+
+comp <- ggplot() +
+  geom_point(data = average_values, aes(x = MRO, y = MIP, color = Group, shape = Media), size = 6) +
+  labs(x = "Competition",
+       y = "Mutualism",
+       color = "Group",
+       shape = "Media") +
+  scale_color_manual(values = c(High = "#00AED7", Low = "#FD9347"), breaks = c("High", "Low")) +
+  scale_shape_manual(values = c(M9 = 16, LB = 17)) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 16),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))+
+    scale_x_continuous(limits = c(0.68, 0.86))
+
+
+print(comp)
+
+# Save the plot
+path_to_save = "/Users/eemanabbasi/Desktop/paper_2/Manuscript_plots/"
+filename = paste0(path_to_save,"MRO_MIP_combinedMedia.pdf")
+ggsave(filename, comp)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+library(beeswarm)
+library(ggbeeswarm)
+
+# Data for group 2
+group_2 <- data.frame(
+  Group = 2,
+  MIP = c(5, 4, 6, 6, 7, 5, 5, 5, 6, 6, 5),
+  MRO = c(0.7785547786, 0.5714285714, 0.7027027027, 0.6666666667, 0.6666666667,
+          0.7567567568, 0.5789473684, 0.6486486486, 0.6486486486, 0.6666666667,
+          0.6486486486)
+)
+
+# Data for group 4
+group_4 <- data.frame(
+  Group = 4,
+  MIP = c(10, 8, 9, 9, 8, 6, 7, 9, 7, 10),
+  MRO = c(0.6769230769, 0.6145833333, 0.6666666667, 0.6344086022, 0.6979166667,
+          0.6354166667, 0.6770833333, 0.6262626263, 0.7513227513, 0.6256410256)
+)
+
+# Data for group 6
+group_6 <- data.frame(
+  Group = 6,
+  MIP = c(10, 10, 10, 12, 11),
+  MRO = c(0.6769230769, 0.6711111111, 0.6442105263, 0.6593406593, 0.647826087)
+)
+
+# Combine all data frames
+all_data <- rbind(group_2, group_4, group_6)
+
+# Calculate average MIP for each group
+avg_mip <- aggregate(MIP ~ Group, data = all_data, FUN = mean)
+# Data for group 2
+group_2 <- data.frame(
+  Group = 2,
+  MIP = c(2, 0, 0, 0, 1, 3, 1, 1, 0, 2),
+  MRO = c(0.72, 0.8888888889, 0.8275862069, 0.7857142857, 0.7142857143, 0.7692307692, 0.8148148148, 0.962962963, 0.8571428571, 0.6923076923)
+)
+# Data for group 4
+group_4 <- data.frame(
+  Group = 4,
+  MIP = c(3, 1, 3, 2, 0),
+  MRO = c(0.703030303, 0.8242424242, 0.6540880503, 0.7485380117, 0.9433962264)
+)
+# Data for group 6
+group_6 <- data.frame(
+  Group = 6,
+  MIP = c(3, 2, 6, 5, 1),
+  MRO = c(0.7623529412, 0.756097561, 0.7180722892, 0.7707317073, 0.8329411765)
+)
+rand_data <- rbind(group_2, group_4, group_6)
+rand_avg_mip <- aggregate(MIP ~ Group, data = rand_data, FUN = mean)
+
+
+m_plot <- ggplot() +
+  geom_quasirandom(data = all_data, aes(x = factor(Group), y = MIP, color = "#FD9347"), legend = "With MG") +
+  geom_quasirandom(data = rand_data, aes(x = factor(Group), y = MIP, color = "grey"), alpha = 0.5, legend = "Without MG") +
+  geom_crossbar(data = avg_mip, aes(x = factor(Group), y = MIP, ymin = MIP - 0.5, ymax = MIP + 0.5, color = "#FD9347"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line segment
+  geom_crossbar(data = rand_avg_mip, aes(x = factor(Group), y = MIP, ymin = MIP - 0.5, ymax = MIP + 0.5, color = "grey"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line
+  labs(x = "Num Species Pairs", y = "Mutualism") +
+  scale_color_manual(name = "", values = c("#FD9347", "grey"), labels = c("With MG", "Without MG")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+filename = paste0(path_to_save, "MG_MIP.pdf")
+ggsave(filename, plot = m_plot, width = 8, height = 6)
+m_plot
+
+avg_mro <- aggregate(MRO ~ Group, data = all_data, FUN = mean)
+
+rand_avg_mro <- aggregate(MRO ~ Group, data = rand_data, FUN = mean)
+
+c_plot <- ggplot() +
+  geom_quasirandom(data = all_data, aes(x = factor(Group), y = MRO, color = "#FD9347"), legend = "With MG") +
+  geom_quasirandom(data = rand_data, aes(x = factor(Group), y = MRO, color = "grey"), alpha = 0.5, legend = "Without MG") +
+  geom_crossbar(data = avg_mro, aes(x = factor(Group), y = MRO, ymin = MRO - 0.02 , ymax = MRO + 0.02, color = "#FD9347"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line segment
+  geom_crossbar(data = rand_avg_mro, aes(x = factor(Group), y = MRO, ymin = MRO - 0.02, ymax = MRO + 0.02, color = "grey"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line
+  labs(x = "Num Species Pairs", y = "Comptition") +
+  scale_color_manual(name = "", values = c("#FD9347", "grey"), labels = c("With MG", "Without MG")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+c_plot
+
+filename = paste0(path_to_save, "MG_MRO.pdf")
+ggsave(filename, plot = c_plot, width = 8, height = 6)
+
+
+```
+
+```{r}
+library(ggplot2)
+library(beeswarm)
+
+# Data for group 2
+group_2 <- data.frame(
+  Group = 2,
+  MIP = c(2, 0, 0, 0, 1, 3, 1, 1, 0, 2),
+  MRO = c(0.72, 0.8888888889, 0.8275862069, 0.7857142857, 0.7142857143,
+          0.7692307692, 0.8148148148, 0.962962963, 0.8571428571, 0.6923076923)
+)
+group_4 <- data.frame(
+  Group = 4,
+  MIP = c(2, 2, 5, 1, 2, 0, 3, 4, 2, 3),
+  MRO = c(0.7712418301, 0.7916666667, 0.6900584795, 0.8104575163, 0.703030303,
+          0.7692307692, 0.7333333333, 0.7485380117, 0.7466666667, 0.7866666667)
+)
+
+group_6 <- data.frame(
+  Group = 6,
+  MIP = c(4, 2, 4, 4, 3, 6, 3, 5, 2, 2),
+  MRO = c(0.7792207792, 0.7532467532, 0.7948717949, 0.7405405405, 0.71,
+          0.7105882353, 0.6962962963, 0.7024390244, 0.7291139241, 0.7168831169)
+)
+
+
+# Combine all data frames
+all_data <- rbind(group_2, group_4, group_6)
+
+# Calculate average MIP for each group
+avg_mip <- aggregate(MIP ~ Group, data = all_data, FUN = mean)
+# Data for group 2
+group_2 <- data.frame(
+  Group = 2,
+  MIP = c(2, 1, 0, 3, 5, 1, 2, 0, 0, 2, 2, 3, 1, 0),
+  MRO = c(0.8, 0.9230769231, 0.9090909091, 0.8125, 0.5714285714, 0.9166666667,
+          0.72, 0.9166666667, 0.8, 0.6428571429, 0.6153846154, 0.75, 0.6896551724, 0.7407407407)
+)
+
+# Data for group 4
+group_4 <- data.frame(
+  Group = 4,
+  MIP = c(4, 1, 1, 1, 3, 3, 4, 0, 4, 5),
+  MRO = c(0.6918238994, 0.7866666667, 0.8194444444, 0.7333333333, 0.8299319728,
+          0.8055555556, 0.8368794326, 0.8533333333, 0.7777777778, 0.6896551724)
+)
+
+# Data for group 6
+group_6 <- data.frame(
+  Group = 6,
+  MIP = c(3, 3, 2, 3, 2, 3, 0, 4, 5, 5),
+  MRO = c(0.734375, 0.7384615385, 0.7857142857, 0.7619047619, 0.8203125,
+          0.775, 0.7868852459, 0.7101449275, 0.7042253521, 0.6554054054)
+)
+
+rand_data <- rbind(group_2, group_4, group_6)
+rand_avg_mip <- aggregate(MIP ~ Group, data = rand_data, FUN = mean)
+
+
+m_plot <- ggplot() +
+  geom_quasirandom(data = all_data, aes(x = factor(Group), y = MIP, color = "#00AED7"), legend = "With SD") +
+  geom_quasirandom(data = rand_data, aes(x = factor(Group), y = MIP, color = "grey"), alpha = 0.5, legend = "Without SD") +
+  geom_crossbar(data = avg_mip, aes(x = factor(Group), y = MIP, ymin = MIP - 0.2, ymax = MIP + 0.2, color = "#00AED7"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line segment
+  geom_crossbar(data = rand_avg_mip, aes(x = factor(Group), y = MIP, ymin = MIP - 0.2, ymax = MIP + 0.2, color = "grey"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line
+  labs(x = "Num Species Pairs", y = "Mutualism") +
+  scale_color_manual(name = "", values = c("#00AED7", "grey"), labels = c("With SD", "Without SD")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+filename = paste0(path_to_save, "SD_MIP.pdf")
+ggsave(filename, plot = m_plot, width = 8, height = 6)
+
+
+avg_mro <- aggregate(MRO ~ Group, data = all_data, FUN = mean)
+
+rand_avg_mro <- aggregate(MRO ~ Group, data = rand_data, FUN = mean)
+
+c_plot <- ggplot() +
+  geom_quasirandom(data = all_data, aes(x = factor(Group), y = MRO, color = "#00AED7"), legend = "With SD") +
+  geom_quasirandom(data = rand_data, aes(x = factor(Group), y = MRO, color = "grey"), alpha = 0.5, legend = "Without SD") +
+  geom_crossbar(data = avg_mro, aes(x = factor(Group), y = MRO, ymin = MRO - 0.01 , ymax = MRO + 0.01, color = "#00AED7"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line segment
+  geom_crossbar(data = rand_avg_mro, aes(x = factor(Group), y = MRO, ymin = MRO - 0.01, ymax = MRO + 0.01, color = "grey"), width = 0.5, alpha = 0.1, show.legend = FALSE) + # Add average line
+  labs(x = "Num Species Pairs", y = "Comptition") +
+  scale_color_manual(name = "", values = c("#00AED7", "grey"), labels = c("With SD", "Without SD")) +
+  theme_minimal(base_size = 16) +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.text = element_text(color = "black"),
+        axis.title = element_text(color = "black", size = 18),
+        legend.title = element_text(color = "black", size = 14),
+        legend.text = element_text(color = "black", size = 12),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.background = element_rect(fill = "white", size = 0.5, linetype = "solid", color = "black"))
+
+filename = paste0(path_to_save, "SD_MRO.pdf")
+ggsave(filename, plot = c_plot, width = 8, height = 6)
+
+```
+
+
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+library(MicrobiotaProcess)
+library(phyloseq)
+
+
+
+# Get class taxa
+classtaxa <- get_taxadf(obj = filt_clr_ps$ps_tumor_filtered, count=FALSE, taxlevel = 6)
+
+
+# Plot
+fclass <- ggbartax(obj = classtaxa, facetNames = "Group", plotgroup = TRUE, topn = 10) +
+          xlab(NULL) +
+          ylab("relative abundance (%)") +
+          guides(fill = guide_legend(keywidth = 0.5, keyheight = 0.5, ncol = 2)) +
+          theme(axis.text.x = element_text(size = 12), axis.text.y = element_text(size = 12),
+                axis.title.y = element_text(size = 16), axis.title.x = element_blank())
+
+# Show the plot
+fclass
+
+
+ggsave(paste0(path_to_save,"relAbun_genus.pdf"),fclass,device = "pdf",width = 8, height = 7 )
+
+
+```
+
+
+```{r}
+library(MicrobiotaProcess)
+library(patchwork)
+# If the input was normalized, the method parameter should be setted NULL.
+pcoares <- get_pcoa(obj=filt_clr_ps$ps_tumor_raw, distmethod="bray", method="hellinger")
+# Visualizing the result
+pcoaplot1 <- ggordpoint(obj=pcoares, biplot=TRUE, speciesannot=TRUE,
+                       factorNames=c("Group"), ellipse=TRUE) +
+            scale_color_manual(values=c("#00AED7", "#FD9347")) +
+            scale_fill_manual(values=c("#00AED7", "#FD9347"))
+# first and third principal co-ordinates
+pcoaplot2 <- ggordpoint(obj=pcoares, pc=c(1, 3), biplot=TRUE, speciesannot=TRUE,
+                        factorNames=c("Group"), ellipse=TRUE) +
+             scale_color_manual(values=c("#00AED7", "#FD9347")) +
+             scale_fill_manual(values=c("#00AED7", "#FD9347"))
+pcoaplot1 | pcoaplot2
+combined_plot <- pcoaplot1 | pcoaplot2
+ggsave(paste0(path_to_save,"pca_combined_plot.jpeg"), plot = combined_plot, width = 10, height = 5, units = "in", dpi = 300)
+
+```
+
+```{r}
+# Assuming you have a vector of gene names or symbols
+
+# Perform gene set enrichment analysis using enrichGO function for Gene Ontology (GO) terms
+library(clusterProfiler)
+
+# Data
+enriched_genes <- c("C8G", "HLA-DQA1", "MASP1", "PLA2G1B", "TNFRSF17")
+group_identity <- c("High", "Low", "High", "High", "High")
+
+# Create a dataframe with enriched_genes and group_identity
+data <- data.frame(Gene = enriched_genes, Group = group_identity)
+
+# Perform gene set enrichment analysis using enrichGO function
+go_enrichment <- enrichGO(gene = data$Gene, 
+                          OrgDb = org.Hs.eg.db,
+                          keyType = "SYMBOL",
+                          ont = "BP",
+                          pAdjustMethod = "BH",
+                          pvalueCutoff = 0.05,
+                          qvalueCutoff = 0.05)
+
+pathway_descriptions <- vector("list", length = length(enriched_genes))
+names(pathway_descriptions) <- enriched_genes
+
+# Iterate over the enriched pathways and concatenate pathway descriptions for each gene
+for (i in seq_along(go_enrichment@result)) {
+  genes_in_pathway <- go_enrichment@result$geneID
+  pathway_desc <- go_enrichment@result$Description
+  
+  for (gene_id in genes_in_pathway) {
+    # Check if the gene is enriched
+    if (gene_id %in% enriched_genes) {
+      # Concatenate pathway descriptions for each enriched gene
+      pathway_descriptions[[gene_id]] <- paste(pathway_descriptions[[gene_id]], pathway_desc, sep = "; ")
+    }
+  }
+}
+
+
+pathway_descriptions <- unlist(pathway_descriptions)
+
+# Create a dataframe with gene IDs and their corresponding pathway descriptions
+gene_pathway_table <- data.frame(Gene_ID = names(pathway_descriptions),
+                                 Pathway_Description = pathway_descriptions,
+                                 stringsAsFactors = FALSE)
+
+# View the dataframe
+gene_pathway_table
+
+
+
+```
+
+
+```{r}
+
+gene_to_find = "TNFRSF17"
+
+for (i in 1:nrow(go_enrichment@result)) {
+  # Check if the gene ID in the current row matches the specified gene
+  if (go_enrichment@result[i, "geneID"] == gene_to_find) {
+    # If there's a match, extract the pathway description
+    pathway_description <- go_enrichment@result[i, "Description"]
+    # Break the loop since we found the description
+    break
+  }
+}
+
+pathway_description
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Assuming you have loaded your microbiome data into `microbiome_data`
+
+# Assuming `up_filt_otu` is your microbiome data
+
+# Filter samples belonging to the "high" group
+high_group_samples <- rownames(up_immune_stad[up_stad_metadata$Group == "High", ])
+low_group_samples <- rownames(up_immune_stad[up_stad_metadata$Group == "Low", ])
+
+# Filter microbiome data for both high and low group samples
+up_filt_otu_high <- up_filt_otu[, high_group_samples]
+up_filt_otu_low <- up_filt_otu[, low_group_samples]
+
+# Calculate total abundance for each sample where abundance is greater than 0 for both groups
+
+community_abundance_high <- colSums(up_filt_otu_high)
+community_abundance_low <- colSums(up_filt_otu_low)
+
+
+# Combine community abundance and immune gene expression data for both groups
+combined_data_high <- data.frame(
+  Community_Abundance = community_abundance_high,
+  Group = "High"
+)
+
+combined_data_low <- data.frame(
+  Community_Abundance = community_abundance_low,
+  Group = "Low"
+)
+
+combined_data <- rbind(combined_data_high, combined_data_low)
+
+# Loop through each immune gene
+for (gene in enriched_genes) {
+  # Extract gene expression data for both groups
+  immune_gene_counts_high <- up_immune_stad[high_group_samples, gene]
+  immune_gene_counts_low <- up_immune_stad[low_group_samples, gene]
+
+  # Create data frame for plotting for both groups
+  plot_data_high <- data.frame(Community_Abundance = log(community_abundance_high), immune_gene_counts = immune_gene_counts_high, Group = "High")
+  plot_data_low <- data.frame(Community_Abundance = log(community_abundance_low), immune_gene_counts = immune_gene_counts_low, Group = "Low")
+  plot_data <- rbind(plot_data_high, plot_data_low)
+  
+  # Calculate correlation for both groups
+  correlation_result_high <- cor(plot_data_high$Community_Abundance, plot_data_high$immune_gene_counts)
+  correlation_result_low <- cor(plot_data_low$Community_Abundance, plot_data_low$immune_gene_counts)
+  p_value_high <- cor.test(plot_data_high$Community_Abundance, plot_data_high$immune_gene_counts)$p.value
+  p_value_low <- cor.test(plot_data_low$Community_Abundance, plot_data_low$immune_gene_counts)$p.value
+  adj_p_value_high <- p.adjust(p_value_high, method = "fdr")  # Benjamini & Hochberg adjustment
+  adj_p_value_low <- p.adjust(p_value_low, method = "fdr")  # Benjamini & Hochberg adjustment
+  
+  # Create scatter plot with immune gene counts as color for both groups
+  plot_title <- paste("", gene, "\nHigh Group Corr:", round(correlation_result_high, 4), "Adj p-value:", round(adj_p_value_high, 4), "\nLow Group Corr:", round(correlation_result_low, 4), "Adj p-value:", round(adj_p_value_low, 4))
+  scatter_plot <- ggplot(plot_data, aes(x = Community_Abundance, y = immune_gene_counts, color = Group)) +
+    geom_point(alpha = 0.6) +  # Adjust transparency for better visualization
+  geom_smooth(method = "lm", se = FALSE) +
+    labs(title = plot_title, x = "Community Abundance", y = "Immune Counts") +
+    theme_minimal()+theme(panel.grid.major = element_blank(),  # Remove major grid lines
+          panel.grid.minor = element_blank())  
+  
+  # Print scatter plot
+  print(scatter_plot)
+}
+
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Assuming you have loaded your microbiome data into `microbiome_data`
+# Assuming `up_filt_otu` is your microbiome data
+
+# Combine all samples
+
+enriched_genes <- rownames(res)[enriched_indices]
+up_immune_stad <- immune_counts[,enriched_indices]
+up_stad_metadata <- filt_clr_ps$ps_tumor_filtered@sam_data[rownames(up_immune_stad)]
+up_filt_otu <- filt_clr_ps$ps_tumor_filtered@otu_table[,rownames(up_stad_metadata)]
+#up_stad_metadata <- raw_ps@sam_data[rownames(up_immune_stad)]
+#up_filt_otu <- raw_ps@otu_table[,rownames(up_stad_metadata)]
+# Filter microbiome data for all samples
+up_filt_otu_combined <- up_filt_otu
+
+# Filter immune gene expression data for all samples
+up_immune_stad_combined <- up_immune_stad
+
+# Calculate total abundance for each sample where abundance is greater than 0 for both groups
+community_abundance <- colSums(up_filt_otu_combined)
+
+# Initialize an empty list to store plots
+scatter_plots <- list()
+
+# Loop through each immune gene
+for (gene in enriched_genes) {
+  # Extract gene expression data for all samples
+  immune_gene_counts <- up_immune_stad_combined[, gene]
+  
+  # Create data frame for plotting
+  plot_data <- data.frame(Community_Abundance = log(community_abundance), immune_gene_counts = immune_gene_counts)
+  
+  # Calculate correlation
+  correlation_result <- cor(plot_data$Community_Abundance, plot_data$immune_gene_counts)
+  p_value <- cor.test(plot_data$Community_Abundance, plot_data$immune_gene_counts)$p.value
+  adj_p_value <- p.adjust(p_value, method = "fdr")  # Benjamini & Hochberg adjustment
+  
+  # Create scatter plot with immune gene counts
+  plot_title <- paste("Correlation:", round(correlation_result, 4), "Adj p-value:", round(adj_p_value, 4))
+  scatter_plot <- ggplot(plot_data, aes(x = Community_Abundance, y = immune_gene_counts)) +
+    geom_point(alpha = 0.6) +  # Adjust transparency for better visualization
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(title = plot_title, x = "log(Community Abundance)", y = paste(gene," Counts")) +
+    theme_bw() +  # Use a white background theme
+    theme(panel.grid.major = element_blank(),  # Remove major grid lines
+          panel.grid.minor = element_blank(),  # Remove minor grid lines
+          axis.line = element_line(size = 0.5),  # Adjust axis line thickness
+          axis.title = element_text(size = 14),  # Adjust axis title size
+          axis.text = element_text(size = 12),   # Adjust axis text size
+          plot.title = element_text(size = 15, hjust = 0.5))  # Adjust plot title size and alignment
+  
+  # Add scatter plot to list
+  scatter_plots[[gene]] <- scatter_plot
+}
+
+# Print scatter plots
+for (i in seq_along(scatter_plots)) {
+  # Save plots as high-resolution images
+  ggsave(filename = paste0(path_to_save,"scatter_plot_", i, ".jpeg"), plot = scatter_plots[[i]], width = 8, height = 6, units = "in", dpi = 300)
+}
+
+scatter_plots
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Assuming you have loaded your microbiome data into `microbiome_data`
+# Assuming `up_filt_otu` is your microbiome data
+
+# Combine all samples
+
+enriched_genes <- rownames(res)[enriched_indices]
+up_immune_stad <- immune_counts[,enriched_indices]
+up_stad_metadata <- filt_clr_ps$ps_tumor_filtered@sam_data[rownames(up_immune_stad)]
+up_filt_otu <- filt_clr_ps$ps_tumor_filtered@otu_table[,rownames(up_stad_metadata)]
+#up_stad_metadata <- raw_ps@sam_data[rownames(up_immune_stad)]
+#up_filt_otu <- raw_ps@otu_table[,rownames(up_stad_metadata)]
+# Filter microbiome data for all samples
+up_filt_otu_combined <- up_filt_otu
+
+# Filter immune gene expression data for all samples
+up_immune_stad_combined <- up_immune_stad
+
+# Calculate total abundance for each sample where abundance is greater than 0 for both groups
+community_abundance <- colSums(up_filt_otu_combined)
+
+# Loop through each immune gene
+for (gene in enriched_genes) {
+  # Extract gene expression data for all samples
+  immune_gene_counts <- up_immune_stad_combined[, gene]
+  
+  # Create data frame for plotting
+  plot_data <- data.frame(Community_Abundance = log(community_abundance), immune_gene_counts = immune_gene_counts)
+  
+  # Calculate correlation
+  correlation_result <- cor(plot_data$Community_Abundance, plot_data$immune_gene_counts)
+  p_value <- cor.test(plot_data$Community_Abundance, plot_data$immune_gene_counts)$p.value
+  adj_p_value <- p.adjust(p_value, method = "fdr")  # Benjamini & Hochberg adjustment
+  
+  # Create scatter plot with immune gene counts
+  plot_title <- paste("", gene, "\nCorrelation:", round(correlation_result, 4), "Adj p-value:", round(adj_p_value, 4))
+  scatter_plot <- ggplot(plot_data, aes(x = Community_Abundance, y = immune_gene_counts)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE) +
+    labs(title = plot_title, x = "Community Abundance", y = "Immune Counts") +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())  # Remove grid lines
+  
+  # Print scatter plot
+  print(scatter_plot)
+}
+
+```
+
+
+#Boostrap the ancombc analyses to randomly assign 1/4 of samples between high and low.
+# 1. repeat to see if enrichment are small or non-existent. 
+# 2. Random assignment influences the patient survival 
+```{r}
+# Load the data 
+cancer_name = "TCGA-STAD"
+state <- "Tumor"
+path_to_save <- "/Users/eemanabbasi/Desktop/Paper_2/Manuscript_plots/ancomb_boostrap/"
+PATH="/Users/eemanabbasi/Desktop/paper_2/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/"
+
+DATA=paste0(PATH,"survival/data/",sep="")
+RESULTS=paste0(PATH,"survival/results/",sep="")
+SCRIPTS=paste0(PATH,"survival/scripts/",sep="")
+
+clinical_filename="TCGA-CDR-CELL-2018.txt" 
+copynumber_signature_exposures_filename="exposure_counts.txt"
+
+num_iterations = 1000
+
+for(i in 440:500){
+
+output <- get_samples(cancer_name, state)
+tcga_sample_id <- output$filtered_samples.tcga_aliquot_id
+cov_ps <- normalize_ps_coverage(output$ps_tumor)
+plot_data <- plot_data_df(cov_ps)
+as_out <- assign_groups_random(plot_data$plot_data,plot_data$ps_clr)
+filt_clr_ps <- filtered_ps(as_out$ps_tumor_clr,output$ps_tumor_raw)
+filt_plot_data <- plot_data_df(filt_clr_ps$ps_tumor_filtered)
+metadata <- data.frame((filt_clr_ps$ps_tumor_filtered@sam_data))
+  #metadata <- data.frame((plot_data$ps_clr@sam_data))
+file_name = paste0(path_to_save,"metadata_", cancer_name, ".txt")
+write.table(metadata, file = file_name, sep = "\t", quote = FALSE, row.names = TRUE)
+ancom_results <- run_ancomb(filt_clr_ps$ps_tumor_raw,cancer_name,state,path_to_save,i)
+write.table(ancom_results, file = paste0(path_to_save,"diff_species_",i, "_.tsv"), sep = ",")
+
+clinical = read.delim(paste0(DATA,clinical_filename, sep=""), sep="\t")
+metadata = metadata
+metadata['bcr_patient_barcode'] = str_sub(metadata$tcga_sample_id,0,12)
+df = merge(clinical, metadata, on='bcr_patient_barcode')
+
+print(dim(clinical))
+print(dim(metadata))
+
+data <- df
+
+
+keep_pats <- which((data$DSS != "#N/A" & data$DSS.time != "#N/A"))
+data <- data[keep_pats,]
+
+data <- data[complete.cases(data$Subtype), ]
+data <- data[data$Subtype != "STAD_POLE", ]
+data <- data[data$Subtype != "STAD_EBV", ]
+  
+data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+surv_object <- Surv(as.numeric(data$DSS.time), event = data$status)
+
+###starting_values <- list(a = 1, b = 1)
+
+#Non_linear releationship
+#nonlinear_model <- nls(as.numeric(DSS.time) ~ a * microbiome_abundance + b * microbiome_richness,
+                     #data = data,
+                     #start = list(a = 1, b = 1))
+
+# View summary of the nonlinear model
+#summary(nonlinear_model)
+
+
+data  = within(data,{Group <- relevel(as.factor(Group), ref = "Low")},
+               {Subtpe <- relevel(as.factor(Subtype), ref = "STAD_CIN")})
+#data  = within(data,{Group <- relevel(as.factor(Group), ref = "Low")})
+#data = na.omit(data)
+
+#data$Group <- relevel(as.factor(data$Group), ref = "Low")
+#data$Subtype <- relevel(as.factor(data$Subtype), ref = "STAD_CIN")
+fit_cox <- coxph(Surv(as.numeric(data$DSS.time), event = data$status) ~  Group + age_at_diagnosis + Subtype + gender, data = data)
+summary_cox <- summary(fit_cox)
+
+
+if (nrow(data) != 0) {
+  
+  fit1 <- survfit(surv_object ~ Group, data = data)
+  
+  # Compute p-values
+  surv_diff_test <- survdiff(surv_object ~ Group , data = data)
+  p_values <- p.adjust(surv_diff_test$pvalue, method = "fdr")
+  write.table( round(p_values, 3), file = paste0(path_to_save, "surv_", i, "_p_values.txt"), sep = "\t", col.names = FALSE, row.names = FALSE)
+  
+  # Create a ggsurvplot
+  plot <- ggsurvplot(
+    fit1,
+    data = data,
+    size = 0.5,
+    palette = c("#FF7F0E","#1F77B4"),
+    conf.int = FALSE,
+    pval = TRUE,
+    pval.method = TRUE,
+    pval.size = 4,
+    pval.adjust.method = "fdr",
+    risk.table = TRUE,
+    risk.table.col = "black",
+    risk.table.title = "",
+    legend.title = "",
+    risk.table.height = 0.26,
+    risk.table.fontsize = 3,
+    risk.table.y.text = FALSE
+  )
+  
+  # Create a text annotation
+  annotation <- geom_text(
+    aes(x = 0.5, y = 0.2, label = paste("FDR p-value =", round(p_values, 3))),
+    size = 3,
+    box.padding = 0.5,
+    direction = "both"
+  )
+
+  
+  # Wrap the plot and annotation in a list
+  #print(list(plot,annotation))
+  plot_list <- plot
+
+  #print(plot_list)
+  
+  
+}
+#plot_with_annotation <- plot + annotation
+  
+# Save the plot as a jpeg file
+pdf(file = paste0(path_to_save, "surv_", i, "_", "_plot.pdf"))
+print(plot)
+dev.off()
+print("**************************************************************************************************************************")
+
+
+
+
+}
+
+
+
+
+
+
+
+```
+
+
+
+```{r}
+# Function to read and parse the second line of a TSV file
+parse_text_file <- function(file_path, file_number) {
+  text <- readLines(file_path, n = 2)  # Read the first two lines of the text file
+  # If there are fewer than 2 lines, return NA for text
+  if (length(text) < 2) {
+    text <- NA
+  } else {
+    text <- text[2]  # Extract the second line
+  }
+  # Create a data frame with one column containing the text
+  df <- data.frame(text = text, stringsAsFactors = FALSE)
+  # Add a column indicating the file number
+  df$File_Number <- file_number
+  return(df)
+}
+
+# Function to read and parse the p-value from the corresponding file
+parse_p_value <- function(file_path, file_number) {
+  p_value_file_path <- file.path(file_path)
+  p_value <- readLines(p_value_file_path)
+  p_value <- as.numeric(p_value[1])  # Convert to numeric
+  print(p_value)
+  return(p_value)
+}
+
+
+folder_path <- "/Users/eemanabbasi/Desktop/paper_2/manuscript_plots/ancomb_boostrap/"
+file_list <- list.files(path = folder_path, pattern = "diff_species_\\d+_.tsv$", full.names = TRUE)
+file_list_pval <- list.files(path = folder_path, pattern = "surv_\\d+_p_values.txt$", full.names = TRUE)
+
+file_list_pval <- gsub("/$", "", file_list_pval)
+
+# Initialize an empty list to store data frames
+dfs <- list()
+
+# Loop through each text file, parse the second line, and store it in the list
+for (i in seq_along(file_list)) {
+  file_path <- file_list[i]
+  df <- parse_text_file(file_path, i)
+  
+  p_value_file_path <- file_list_pval[i]
+  #print(p_value_file_path)  # Print the constructed file path
+  p_value_df <- parse_p_value(p_value_file_path, i)
+  df$p_value <- p_value_df  # Assuming p_value_df contains the p-value directly
+
+  dfs[[i]] <- df
+}
+
+# Combine all data frames into a single data frame
+combined_df <- bind_rows(dfs)
+column_names <- c("#","x", "y", "label", "group")
+
+
+# View the combined data frame
+combined_df <- combined_df %>%
+  separate(text, into = paste0("col", 1:5), sep = ",", fill = "right")
+
+combined_df <- combined_df %>%
+  rename_with(~ column_names, 1:5)
+
+combined_df <- combined_df %>%
+  mutate_all(~ ifelse(. == "NA", NA, .))
+
+# Add a column indicating whether each row contains NAs or not
+combined_df$is_empty <- is.na(combined_df$label)
+
+
+# View the updated combined data frame
+#print(combined_df)
+
+library(dplyr)
+
+# Group by label and group, count occurrences
+summary_stats <- combined_df %>%
+  group_by(label, group) %>%
+  summarize(
+    occurrences = n(),
+    percentage = (n() / 500) * 100# Count occurrences
+  ) %>%
+  arrange(desc(occurrences))  # Arrange by descending occurrences
+
+# View summary statistics
+library(ggplot2)
+
+# Replace NA values with "No enriched species" in the label column
+summary_stats$label <- ifelse(is.na(summary_stats$label), "No enriched species", summary_stats$label)
+
+# Create the plot with custom theme
+p <- ggplot(summary_stats, aes(x = label, y = percentage, fill = group)) +
+  geom_bar(stat = "identity", position = "dodge") +  # Increase width to 0.8
+  labs(title = "",
+       x = "",
+       y = " % Occurrences",
+       fill = "Group") +
+  scale_fill_manual(values = c("#FF7F0E", "#1F77B4", "#A6CEE3"),  # Fill colors for Low, High, No enriched species
+                    labels = c("Low", "High", "No enriched species")) +  # Custom legend labels
+  theme_minimal() +  # Minimalist theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+        plot.title = element_text(face = "bold", size = 14),  # Title appearance
+        axis.title = element_text(face = "bold", size = 12),  # Axis label appearance
+        legend.title = element_text(face = "bold", size = 12),  # Legend title appearance
+        legend.text = element_text(size = 10),  # Legend label appearance
+        legend.position = "right",  # Legend position
+        panel.border = element_blank(),  # Remove panel border
+        panel.grid.major = element_blank(),  # Remove major gridlines
+        panel.grid.minor = element_blank(),  # Remove minor gridlines
+        panel.background = element_rect(fill = "transparent"),
+                plot.margin = margin(1, 1, 1.5, 1, "cm"))  # Adjust plot margins
+
+
+#ggsave(paste0("/Users/eemanabbasi/Desktop/Paper_2/Manuscript_plots/","ancomb_boostrap.pdf"), p, width = 10, height = 6)
+
+print(p)
+
+
+```
+
+
+```{r}
+# Function to determine if p-value is significant
+is_significant <- function(p_value, threshold = 0.05) {
+  return(p_value < threshold)
+}
+
+# Initialize counters for significant and non-significant occurrences
+significant_count <- 0
+non_significant_count <- 0
+
+# Loop through each p-value file
+for (i in seq_along(file_list_pval)) {
+  p_value_df <- parse_p_value(file_list_pval[i], i)
+  
+  # Check if the p-value is significant
+  if (is_significant(p_value_df)) {
+    significant_count <- significant_count + 1
+  } else {
+    non_significant_count <- non_significant_count + 1
+  }
+}
+
+# Calculate percentages
+total_count <- length(file_list_pval)
+significant_percentage <- (significant_count / total_count) * 100
+non_significant_percentage <- (non_significant_count / total_count) * 100
+
+# Print the results
+cat("Significant p-values:", significant_count, "\n")
+cat("Non-significant p-values:", non_significant_count, "\n")
+cat("Percentage of significant p-values:", significant_percentage, "%\n")
+cat("Percentage of non-significant p-values:", non_significant_percentage, "%\n")
+
+# Create data frame for plotting
+p_value_data <- data.frame(
+  P_value = c("Significant p", "Non-significant p"),
+  percentage = c(significant_percentage, non_significant_percentage)
+)
+
+# Define elegant and light colors
+color_palette <- c("#808080","#B7410E")  # Rust and grey
+
+# Create the plot
+p <- ggplot(p_value_data, aes(x = "", y = percentage, fill = P_value, label = paste0(round(percentage), "%"))) +
+  geom_bar(stat = "identity") +
+  geom_text(position = position_stack(vjust = 0.5), color = "black", size = 4) +  # Add percentage labels
+  coord_polar("y", start = 0) +  # Convert bar plot to pie chart
+  theme_void() + theme(
+    legend.title = element_blank()  # Remove legend title
+  )+ # Remove axis and background
+  scale_fill_manual(values = color_palette)  # Custom fill colors
+
+# Print the plot
+print(p)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+
+# Filter out rows with label "No enriched species"
+summary_stats_filtered <- summary_stats[summary_stats$label != "No enriched species", ]
+
+# Create the plot with custom theme and adjusted plot margins
+p <- ggplot(summary_stats_filtered, aes(x = label, y = percentage, fill = group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "",
+       x = "",
+       y = " % Occurrences",
+       fill = "Group") +
+  scale_fill_manual(values = c("#FF7F0E", "#1F77B4"),  # Fill colors for Low and High groups
+                    labels = c("Low", "High")) +  # Custom legend labels
+  theme_minimal() +  # Minimalist theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels
+        plot.title = element_text(face = "bold", size = 14),  # Title appearance
+        axis.title = element_text(face = "bold", size = 12),  # Axis label appearance
+        legend.title = element_text(face = "bold", size = 12),  # Legend title appearance
+        legend.text = element_text(size = 10),  # Legend label appearance
+        legend.position = "right",  # Legend position
+        panel.border = element_blank(),  # Remove panel border
+        panel.grid.major = element_blank(),  # Remove major gridlines
+        panel.grid.minor = element_blank(),  # Remove minor gridlines
+        panel.background = element_rect(fill = "transparent"),  # Transparent panel background
+        plot.margin = margin(1.5, 1.5, 2, 1.5, "cm"))  # Adjust plot margins
+p
+# Save the plot with larger dimensions and adjusted margins
+#ggsave(paste0("/Users/eemanabbasi/Desktop/Paper_2/Manuscript_plots/","ancomb_boostrap.pdf"), p, width = 17, height = 8)
+
+```
+```{r}
+library(ggplot2)
+
+# Subset data for non-enriched and enriched species
+non_enriched_data <- summary_stats[summary_stats$label == "No enriched species", ]
+enriched_data <- summary_stats[summary_stats$group == c( "\"High\"", "\"Low\""), ]
+
+enriched_total<- sum(enriched_data$occurrences[2:length(enriched_data$occurrences)])
+enriched_percentage <- 100-non_enriched_data$percentage
+
+enriched_row <- data.frame(label = "Enriched species", group = "Enriched", occurrences = enriched_total, percentage = enriched_percentage)
+non_enriched_data <- rbind(non_enriched_data, enriched_row)
+
+clean_summary <- summary_stats %>%
+  mutate(label = gsub("\"", "", label) %>% trimws())
+
+# Summarize occurrences and percentages
+library(dplyr)
+library(tidyr)
+
+# Extract the first word from the label
+summary_stats_fw <- summary_stats %>%
+  mutate(label = word(label, 1))  #
+# Group by first word label and summarize
+consolidated_data <- summary_stats_fw %>%
+  group_by(label, group) %>%
+  summarise(occurrences = sum(occurrences), percentage = sum(percentage)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  summarise(occurrences = sum(occurrences), percentage = sum(percentage)) %>%
+  ungroup()
+
+
+consolidated_data <- consolidated_data[consolidated_data$label != "No", ]
+
+
+
+custom_colors <- c(
+  "#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#33A02C",
+  "#E6AB02", "#A6761D", "#666666", "#A6CEE3", "#1F78B4",
+  "#B2DF8A", "#FB9A99", "#E31A1C", "#E66101",
+  "#1C2833", "#CAB2D6", "#6A3D9A", "#FFFF99", "#B15928",
+  "#827717", "#FDBE85","#B7410E"
+)
+
+# Create custom color palette
+custom_palette <- scales::show_col(custom_colors)
+custom_palette
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# Get the positions
+df2 <- consolidated_data %>% 
+  mutate(csum = rev(cumsum(rev(percentage))), 
+         pos = percentage/2 + lead(csum, 1),
+         pos = if_else(is.na(pos), percentage/2, pos))
+
+enriched_ssp <- ggplot(consolidated_data, aes(x = "" , y = percentage, fill = label)) +
+  geom_col(width = 1, color = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = custom_colors) +  # Using the custom color palette
+  geom_label_repel(data = df2,
+                   aes(y = pos, label = ifelse(percentage > 0.4, paste0(round(percentage, 1), "%"), "")),
+                   size = 4.5, nudge_x = 1, show.legend = FALSE) +
+  guides(fill = guide_legend(title = "")) +
+  theme_void()
+
+filename = paste0(path_to_save,"enriched_species_distribution_pie.pdf")
+ggsave(filename, plot = enriched_ssp, width = 6, height = 6, dpi = 300)
+
+
+
+
+# Function to determine if p-value is significant
+is_significant <- function(p_value, threshold = 0.05) {
+  return(p_value < threshold)
+}
+
+# Initialize counters for significant and non-significant occurrences
+significant_count <- 0
+non_significant_count <- 0
+
+# Loop through each p-value file
+for (i in seq_along(file_list_pval)) {
+  p_value_df <- parse_p_value(file_list_pval[i], i)
+  
+  # Check if the p-value is significant
+  if (is_significant(p_value_df)) {
+    significant_count <- significant_count + 1
+  } else {
+    non_significant_count <- non_significant_count + 1
+  }
+}
+
+# Calculate percentages
+total_count <- length(file_list_pval)
+significant_percentage <- (significant_count / total_count) * 100
+non_significant_percentage <- (non_significant_count / total_count) * 100
+
+# Print the results
+cat("Significant p-values:", significant_count, "\n")
+cat("Non-significant p-values:", non_significant_count, "\n")
+cat("Percentage of significant p-values:", significant_percentage, "%\n")
+cat("Percentage of non-significant p-values:", non_significant_percentage, "%\n")
+
+# Create data frame for plotting
+p_value_data <- data.frame(
+  P_value = c("Significant", "Non-significant"),
+  percentage = c(significant_percentage, non_significant_percentage)
+)
+
+
+# Create the plot
+p <- ggplot(p_value_data, aes(x = "", y = percentage, fill = P_value)) +
+  geom_col(width = 1, color = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = custom_colors, name = "P value") +  # Using the custom color palette
+  geom_label_repel(data = p_value_data,
+                   aes(y = percentage/2, label = paste0(round(percentage, 1), "%")),
+                   size = 4.5, nudge_x = 0.1, show.legend = FALSE) +
+  guides(fill = guide_legend(title = "P value")) +
+  theme_void()
+
+# Print the plot
+print(p)
+filename = paste0(path_to_save,"surv_pie.pdf")
+ggsave(filename, plot = p, width = 6, height = 6, dpi = 300)
+
+
+
+
+library(ggplot2)
+library(ggrepel)
+# Define custom colors
+custom_colors <- c("#B3DFFA", "#C9C8C8")
+
+# Create the pie chart
+p_pie_1 <- ggplot(non_enriched_data, aes(x = "", y = percentage, fill = label)) +
+  geom_col(width = 1, color = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = custom_colors) +  # Using the custom color palette
+  geom_label_repel(data = non_enriched_data,
+                   aes(y = percentage, label = paste0(round(percentage, 1), "%")),
+                   size = 4.5, nudge_x = 0.1, show.legend = FALSE) +
+  geom_segment(data = non_enriched_data,  # Pass non_enriched_data directly to geom_segment
+               aes(x = 0, y = 0, xend = cos((cumsum(percentage) - 0.5 * percentage) * 2 * pi / 100),
+                   yend = sin((cumsum(percentage) - 0.5 * percentage) * 2 * pi / 100)),
+               color = "black", size = 0.5, alpha = 0.5) +  # Draw lines
+  theme_void()
+filename = paste0(path_to_save,"enriched_pie.pdf")
+ggsave(filename, plot = p, width = 6, height = 6, dpi = 300)
+
+
+
+
+p <- ggplot(non_enriched_data, aes(x = "", y = percentage, fill = label))+
+  geom_col(width = 1, color = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = custom_colors, name = "") +  # Using the custom color palette
+  geom_label_repel(data = non_enriched_data,
+                   aes(y = (percentage) - 25,  # Adjusted y aesthetic based on percentage
+                       label = paste0(round(percentage, 1), "%")),
+                   size = 4.5, show.legend = FALSE) +
+  guides(fill = guide_legend(title = "")) +
+  theme_void()
+# Print the pie chart
+filename = paste0(path_to_save,"enriched_pie.pdf")
+ggsave(filename, plot = p, width = 6, height = 6, dpi = 300)
+
+
+
+
+
+```
+```{r}
+df2 <- df %>% 
+  mutate(csum = rev(cumsum(rev(value))), 
+         pos = value/2 + lead(csum, 1),
+         pos = if_else(is.na(pos), value/2, pos))
+
+ggplot(df, aes(x = "" , y = value, fill = fct_inorder(group))) +
+  geom_col(width = 1, color = 1) +
+  coord_polar(theta = "y") +
+  scale_fill_brewer(palette = "Pastel1") +
+  geom_label_repel(data = df2,
+                   aes(y = pos, label = paste0(value, "%")),
+                   size = 4.5, nudge_x = 1, show.legend = FALSE) +
+  guides(fill = guide_legend(title = "Group")) +
+  theme_void()
+```
+
+```{r}
+  scale_fill_manual(values = custom_colors) +  # Using the custom color palette
+
+library(dplyr)
+library(ggplot2)
+
+# Combine "Low" and "High" groups into "Enriched"
+summary_stats$group <- ifelse(summary_stats$group %in% c("\"Low\"", "\"High\""), "Enriched", "Not enriched")
+
+# Create the plot
+p_pie <- ggplot(summary_stats, aes(x = "", y = percentage, fill = group)) +
+  geom_bar(stat = "identity", width = 1) +  # Use geom_bar for pie chart
+  coord_polar("y", start = 0) +  # Convert bar plot to pie chart
+  labs(title = "Percentage Occurrences of Labels",
+       fill = "Group") +
+  scale_fill_manual(values = c("#1F77B4", "#FF7F0E"),  # Fill colors for "Enriched" and "Not enriched"
+                    labels = c("Enriched", "Not enriched")) +  # Custom legend labels
+  theme_void() +  # Remove axis and background
+  theme(
+    legend.position = "bottom"  # Legend position
+  )
+
+# Save the plot
+filename = paste0(path_to_save,)
+ggsave("pie_chart.png", plot = p_pie, width = 6, height = 6, dpi = 300)
+print(p_pie)
+
+```
+
+```{r}
+library(ggplot2)
+
+# Calculate total occurrences for Low and High groups
+total_low_high <- sum(summary_stats$percentage[summary_stats$group %in% c("\"Low\"", "\"High\"")])
+
+# Calculate combined percentage occurrences for "No enriched species" and Low/High groups
+combined_percentage <- c(summary_stats$percentage[summary_stats$label == "No enriched species"], total_low_high)
+
+# Create a vector of labels including "No enriched species" and a combined label
+combined_labels <- c("No enriched species", "Combined (Low & High)")
+
+# Create a data frame for plotting
+combined_data <- data.frame(label = combined_labels, percentage = combined_percentage)
+
+# Create the plot
+p_combined <- ggplot(combined_data, aes(x = "", y = percentage, fill = label)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Percentage Occurrences of Labels",
+       x = "",
+       y = "Percentage of Occurrences") +
+  scale_fill_manual(values = c("#A6CEE3", "#FF7F0E")) +  # Colors for "No enriched species" and combined
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),  # Hide x-axis labels
+        axis.ticks.x = element_blank())  # Hide x-axis ticks
+
+# Save the plot
+#ggsave("stacked_bar_plot.png", p_combined, width = 8, height = 6)
+p_combined
+```
+
+
+
+```{r}
+# Load necessary libraries
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(ggrepel)
+
+# Load your phyloseq object (replace 'your_phyloseq_object' with your actual phyloseq object)
+# ps <- your_phyloseq_object
+
+# Assuming 'your_phyloseq_object' is the phyloseq object and the factor is stored in the sample data
+# For demonstration, let's assume the phyloseq object is named `ps` and the grouping factor is "Group"
+
+
+otu_counts <- ps_high@otu_table
+tax_table <- ps_high@tax_table
+metadata <- ps_high@sam_data
+
+taxa_abundance <- rowSums(otu_counts)
+
+# Sort taxa abundance in descending order
+sorted_taxa <- taxa_abundance[order(-taxa_abundance)]
+
+# Calculate cumulative proportion
+cumulative_proportion <- cumsum(sorted_taxa) / sum(sorted_taxa)
+
+# Find index where cumulative proportion exceeds 90%
+index <- which.max(cumulative_proportion >= 0.95)
+
+# Select taxa based on the index
+selected_taxa <- sorted_taxa[1:index]
+
+# Print or further manipulate the selected taxa
+print(selected_taxa)
+
+
+
+
+```
+
+```{r}
+otu_table <- ps_low@otu_table
+tax_table <- ps_low@tax_table
+metadata <- ps_low@sam_data
+
+# Define the taxa names you want to keep
+taxa_to_keep <- c( "Shewanella_decolorationis", "Malassezia_globosa", "Pseudomonas_migulae",
+    "Pseudomonas_mandelii", "Pseudomonas_baetica", "Pseudomonas_libanensis",
+    "Acidovorax_temperans", "Bacillus_anthracis", "Pseudomonas_chlororaphis",
+    "Pseudomonas_asplenii", "Bacillus_flexus", "Pseudomonas_viridiflava",
+    "Pseudomonas_syringae", "Pseudomonas_aeruginosa", "Saccharomyces_cerevisiae",
+    "Malassezia_restricta", "Fusobacterium_nucleatum", "Klebsiella_oxytoca",
+    "Diaphorobacter_nitroreducens", "Achromobacter_xylosoxidans", "Prevotella_oris",
+    "Streptococcus_pneumoniae", "Pseudomonas_fulva", "Pseudomonas_alcaligenes",
+    "Fusobacterium_periodonticum", "Prevotella_melaninogenica", "Parvimonas_micra",
+    "Klebsiella_pneumoniae", "Clostridium_perfringens", "Pseudomonas_mendocina",
+    "Enterobacter_cloacae", "Rhodotorula_graminis", "Pseudomonas_oleovorans"
+)
+
+taxa_high <- c("Shewanella_decolorationis", "Pseudomonas_migulae", "Pseudomonas_baetica", "Pseudomonas_mandelii", "Pseudomonas_chlororaphis", "Pseudomonas_libanensis", "Pseudomonas_viridiflava", "Pseudomonas_asplenii", "Pseudomonas_syringae", "Candida_albicans", "Pseudomonas_aeruginosa", "Acidovorax_temperans", "Xanthomonas_campestris")
+
+
+# Filter the OTU table to keep only the specified taxa
+filtered_otu_table <- otu_table[rownames(otu_table) %in% taxa_to_keep, ]
+
+#Coocurrance analysis functions
+cooccur_filter <- function(RA="relative abundance", co_per=0.5){
+  logic_RA=(RA>0)*1
+  filter=(colSums(logic_RA)/nrow(logic_RA))>=co_per
+  filter_RA=RA[,filter]
+  return(filter_RA)
+}
+
+cooccurrence<-function(data ="relative abundance",taxon=NULL,type="sp",cor=0.6,pval=0.01){
+  require(igraph)
+  require(Hmisc)
+  ifelse(type=="sp",corrMatrix <- rcorr(as.matrix(data),type="spearman"),corrMatrix <- rcorr(as.matrix(data),type="pearson"))
+  pAdjusted=p.adjust(corrMatrix$P,method = "BH")
+  corrMatrixMin=(((abs(corrMatrix$r)>cor)*1+(pAdjusted<pval)*1)==2)*1
+  diag(corrMatrixMin)=0
+  corrMatrixTax=corrMatrixMin[rowSums(corrMatrixMin)>1,colSums(corrMatrixMin)>1]
+  #taxon.netw=droplevels(taxon[which(rownames(taxon)%in%gsub("V","",colnames(corrMatrixTax))),])
+  netw.corr=graph.adjacency(corrMatrixMin,mode="undirected",weighted=TRUE)
+  netw.corr.trim=delete_vertices(netw.corr,igraph::degree(netw.corr)<1)
+  taxon.netw <- taxon[which(rownames(taxon)%in%V(netw.corr.trim)$name),]
+
+  return(list("corr"=corrMatrix,"corrMin"=corrMatrixMin,"netw"=netw.corr.trim,"taxon.netw"=taxon.netw,pAdjusted=as.matrix(pAdjusted)))
+}
+
+#filter the data based on high and low samples 
+
+#High = "#00AED7", Low = "#FD9347"
+RA= filtered_otu_table
+tax_val = ps_low@tax_table
+biom_fil=cooccur_filter(t(RA),co_per=0.5)
+path_to_save <- "/Users/eemanabbasi/Desktop/Paper_2/Manuscript_plots/interaction_potential/"
+
+
+#run co-occurence. Taxon can be excluded and identified later if desired.
+biom_netw=cooccurrence(biom_fil,taxon = tax_val)
+co_occurrence_communities <- cluster_fast_greedy(biom_netw$netw, weights = E(biom_netw$netw)$weight)
+
+#pdf(file = paste0(path_to_save,"subcommunity_high.pdf"))
+plot(co_occurrence_communities,biom_netw$netw, vertex.label = NA)
+dev.off()
+
+
+co_occurrence_membership <- membership(co_occurrence_communities)
+
+co_occurrence_df = as.data.frame(cbind(co_occurrence_communities$membership, co_occurrence_communities$names))
+co_occurrence_df 
+
+colnames(co_occurrence_df)<- c("group", "names")
+
+
+##jpeg(file = paste0(path_to_save,"hist_high.pdf"))
+#plot(hist(co_occurrence_df))
+
+co_occurrence_df$group <- as.numeric(co_occurrence_df$group)
+co_occurrence_df$group <- as.factor(co_occurrence_df$group)
+group_counts <- table(co_occurrence_df$group)
+
+
+abundance_data <- as.data.frame(filtered_otu_table)
+
+# Step 2: Add the 'group' information to the OTU table
+abundance_data$group <- factor(co_occurrence_df$group[match(rownames(abundance_data), co_occurrence_df$names)])
+
+# Step 3: Summarize the abundance by group
+abundance_by_group <- aggregate(abundance_data[, -ncol(abundance_data)], by = list(group = abundance_data$group), FUN = sum)
+
+row_sums <- rowSums(abundance_by_group[, -1])
+group_ids <- abundance_by_group$group
+
+# Plot the row sums
+library(ggplot2)
+
+# Create a data frame from row sums for plotting
+row_sums_df <- data.frame(group = group_ids, Abundance = (row_sums))
+
+#abundance_by_group$Abundance <- as.numeric(abundance_by_group$Abundance)
+
+
+
+#pdf(file = paste0(path_to_save,"abundance_high.pdf"))
+barplot((row_sums_df$Abundance), 
+        names.arg = row_sums_df$group,
+        xlab = "Subcommunity ID", 
+        ylab = "Community Abundance", 
+        col = "#1F77B4",
+        border = "black",
+        cex.names = 1.5,   # Adjust the size of group names
+        cex.axis = 1.5,    # Adjust the size of axis labels
+        cex.lab = 1.5)
+dev.off()
+
+
+
+#pdf(file = paste0(path_to_save,"richness_high.pdf"))
+
+# Create the bar plot with adjusted label size
+barplot(group_counts, 
+        xlab = "Subcommunity ID", 
+        ylab = "Num Species", 
+        col = "#1F77B4", 
+        border = "black",
+        cex.names = 1.5,  # Set the size of group names
+        cex.axis = 1.5,   # Set the size of axis labels
+        cex.lab = 1.5)    # Set the size of axis titles and labels
+
+dev.off()
+
+
+
+
+
+co_occurrence_df_1 <- co_occurrence_df[co_occurrence_df$group==15,]
+co_occurrence_df_1_names <- co_occurrence_df_1$names
+
+co_occurrence_df_2 <- co_occurrence_df[co_occurrence_df$group==2,]
+co_occurrence_df_2_names <- co_occurrence_df_2$names
+
+co_occurrence_df_3 <- co_occurrence_df[co_occurrence_df$group==6,]
+co_occurrence_df_3_names <- co_occurrence_df_3$names
+
+co_occurrence_df_4 <- co_occurrence_df[co_occurrence_df$group==10,]
+co_occurrence_df_4_names <- co_occurrence_df_4$names
+
+
+
+```

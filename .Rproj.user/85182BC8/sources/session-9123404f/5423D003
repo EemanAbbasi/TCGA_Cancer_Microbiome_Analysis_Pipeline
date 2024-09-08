@@ -3,7 +3,7 @@
     "path": "~/Documents/GitHub/cancer_immune_tcga/index.Rmd",
     "project_path": "index.Rmd",
     "type": "r_markdown",
-    "hash": "3978306413",
+    "hash": "0",
     "contents": "",
     "dirty": false,
     "created": 1725816342180.0,
@@ -13,7 +13,7 @@
         "chunk_output_type": "inline",
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "2,21",
+        "cursorPosition": "0,0",
         "scrollLine": "0"
     },
     "folds": "",
