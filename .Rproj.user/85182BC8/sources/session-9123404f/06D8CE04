@@ -1,0 +1,28 @@
+{
+    "id": "06D8CE04",
+    "path": "~/Documents/GitHub/cancer_immune_tcga/coverage_stad.Rmd",
+    "project_path": "coverage_stad.Rmd",
+    "type": "r_markdown",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1725816408843.0,
+    "source_on_save": false,
+    "relative_order": 3,
+    "properties": {
+        "tempName": "Untitled1",
+        "chunk_output_type": "inline",
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "6,6",
+        "scrollLine": "25"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1725816427,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1725816427662,
+    "read_only": false,
+    "read_only_alternatives": []
+}
