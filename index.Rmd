@@ -1,7 +1,6 @@
 ---
 title: "Cancer TCGA analysis Thesis Chapter 2"
-rmarkdown::github_document
-
+output: rmarkdown::github_document
 ---
  
 
