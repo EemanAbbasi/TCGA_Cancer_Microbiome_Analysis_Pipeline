@@ -1,6 +1,6 @@
 ---
 title: "Cancer TCGA analysis Thesis Chapter 2"
-output: html_notebook
+rmarkdown::github_document
 
 ---
  
