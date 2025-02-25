@@ -1,0 +1,498 @@
+---
+title: "Disease-specific survival & cn analyses"
+output: html_notebook
+---
+
+
+```{r}
+#### Directory path  to change 
+PATH="/Users/ammalabbasi/Desktop/Projects/copynumber.assoications/cn.signatures.associations/"
+# do not change this!
+
+DATA=paste0(PATH,"survival/data/",sep="")
+RESULTS=paste0(PATH,"survival/results/",sep="")
+SCRIPTS=paste0(PATH,"survival/scripts/",sep="")
+
+clinical_filename="TCGA-CDR-CELL-2018.txt" 
+copynumber_signature_exposures_filename="exposure_counts.txt"
+```
+
+```{r}
+# Load Libraries
+library('survminer')
+library("survival")
+library(ggplot2)
+library("readxl")
+library(data.table)
+library(gplots)
+library(dplyr)
+library(gridExtra)
+library(forcats)
+library('flexsurv')
+library(ciTools)
+library(lemon)
+```
+
+```
+
+# COX PROPORTIONAL HAZARD MODEL -- TISSUE + BINARY CN
+
+```
+
+```{r}
+# Load copy number data:
+cn_sig_exp <- read.delim(paste0(DATA,copynumber_signature_exposures_filename,sep=""), header=T, stringsAsFactors = FALSE);
+names(cn_sig_exp)[names(cn_sig_exp) == "X"] <- "bcr_patient_barcode"
+cn_sig_exp["bcr_patient_barcode"] <- substr(cn_sig_exp$"bcr_patient_barcode",1,12) # getting rid of the weird -b, -c extensions in sample names #9,699  
+cn_sig_exp <- subset (cn_sig_exp, select = -CN13) # remove CN13 with all zeros (recommended by Chris)
+print(paste0("Number of samples in copy number dataset: " , nrow(cn_sig_exp), sep=""))
+
+# Updates -- rename signatures 01/21/2022
+renameSigs = paste0("CN",1:21)
+names(renameSigs) = paste0("CN",c(1:12,20:22,14:19))
+colnames(cn_sig_exp)[-1]=renameSigs[colnames(cn_sig_exp)[-1]]
+
+# Load clinical data
+clinical <- read.delim(paste0(DATA,clinical_filename,sep=""), header=T, stringsAsFactors = FALSE);
+print(paste0("Number of samples in clinical dataset: " , nrow(clinical), sep=""))
+
+# Remove duplicates
+clinical <- clinical[!duplicated(clinical$bcr_patient_barcode), ];
+print(paste0("Number of samples in clinical dataset after removing duplicates: " , nrow(clinical), sep=""))
+
+# Remove redacted samples
+clinical <- clinical[(clinical$Redaction!="Redacted"),] # remove samples redacted from the final set of samples 
+print(paste0("Number of samples in clinical dataset after removing redacted samples: " , nrow(clinical), sep=""))
+
+# Merge copy number data and clinical dataset
+df <- merge(clinical,cn_sig_exp, by ="bcr_patient_barcode");
+print(paste0("Number of samples in merged dataset: " , nrow(df), sep=""))
+
+# Keep only columns to use:
+columns_to_use = names(df)[which(grepl( "bcr_patient_barcode|gender|age_at_initial_pathologic_diagnosis|DSS|DSS.time|type|CN|Redaction" , names( df ) ))]
+df = df[,columns_to_use ];
+
+# Replace non-zero values of copy number signatures with 1  --> binary annotation of cn sigs
+cns_columns = names(df)[which(grepl( "CN" , names( df ) ))]
+df[,cns_columns][(df[,cns_columns])>0] = 1
+```
+```{r}
+table = run.coxph(df,"type", RESULTS)
+plot.coxph(table,NA,"CN", RESULTS,ylabel="Copy Number Signatures",xlimit=2,text_space=0.1,xlimit_break=0.5)
+plot.coxph(table,NA,"tissue", RESULTS,ylabel="Tissues",xlimit=5,text_space=0.5,xlimit_break=1)
+```
+
+
+
+```
+
+# Acceleration Failure Time (AFT) MODEL -- TISSUE + BINARY CN
+
+```
+
+
+```{r}
+# Load copy number data:
+cn_sig_exp <- read.delim(paste0(DATA,copynumber_signature_exposures_filename,sep=""), header=T, stringsAsFactors = FALSE);
+names(cn_sig_exp)[names(cn_sig_exp) == "X"] <- "bcr_patient_barcode"
+cn_sig_exp["bcr_patient_barcode"] <- substr(cn_sig_exp$"bcr_patient_barcode",1,12) # getting rid of the weird -b, -c extensions in sample names #9,699  
+cn_sig_exp <- subset (cn_sig_exp, select = -CN13) # remove CN13 with all zeros (recommended by Chris)
+print(paste0("Number of samples in copy number dataset: " , nrow(cn_sig_exp), sep=""))
+
+# Updates -- rename signatures 01/21/2022
+renameSigs = paste0("CN",1:21)
+names(renameSigs) = paste0("CN",c(1:12,20:22,14:19))
+colnames(cn_sig_exp)[-1]=renameSigs[colnames(cn_sig_exp)[-1]]
+
+
+# Load clinical data
+clinical <- read.delim(paste0(DATA,clinical_filename,sep=""), header=T, stringsAsFactors = FALSE);
+print(paste0("Number of samples in clinical dataset: " , nrow(clinical), sep=""))
+
+# Remove duplicates
+clinical <- clinical[!duplicated(clinical$bcr_patient_barcode), ];
+print(paste0("Number of samples in clinical dataset after removing duplicates: " , nrow(clinical), sep=""))
+
+# Remove redacted samples
+clinical <- clinical[(clinical$Redaction!="Redacted"),] # remove samples redacted from the final set of samples 
+print(paste0("Number of samples in clinical dataset after removing redacted samples: " , nrow(clinical), sep=""))
+
+# Merge copy number data and clinical dataset
+df <- merge(clinical,cn_sig_exp, by ="bcr_patient_barcode");
+print(paste0("Number of samples in merged dataset: " , nrow(df), sep=""))
+
+# Keep only columns to use:
+columns_to_use = names(df)[which(grepl( "bcr_patient_barcode|gender|age_at_initial_pathologic_diagnosis|DSS|DSS.time|type|CN|Redaction" , names( df ) ))]
+df = df[,columns_to_use ];
+
+# Replace non-zero values of copy number signatures with 1  --> binary annotation of cn sigs
+cns_columns = names(df)[which(grepl( "CN" , names( df ) ))]
+df[,cns_columns][(df[,cns_columns])>0] = 1
+```
+```{r}
+table = run.aft(df,"type", RESULTS)
+plot.aft(table,NA,"CN", RESULTS,xlimit=2,text_space=0.1,xlimit_break=0.5)
+plot.aft(table,NA,"tissue", RESULTS,xlimit=5,text_space=0.5,ylabel="Tissues",xlimit_break=1)
+```
+
+
+
+```
+
+# TISSUE-SPECIFIC SURVIVAL ANALYSIS
+
+```
+
+```{r}
+# Load copy number data:
+cn_sig_exp <- read.delim(paste0(DATA,copynumber_signature_exposures_filename,sep=""), header=T, stringsAsFactors = FALSE);
+names(cn_sig_exp)[names(cn_sig_exp) == "X"] <- "bcr_patient_barcode"
+cn_sig_exp["bcr_patient_barcode"] <- substr(cn_sig_exp$"bcr_patient_barcode",1,12) # getting rid of the weird -b, -c extensions in sample names #9,699  
+cn_sig_exp <- subset (cn_sig_exp, select = -CN13) # remove CN13 with all zeros (recommended by Chris)
+print(paste0("Number of samples in copy number dataset: " , nrow(cn_sig_exp), sep=""))
+
+# Updates -- rename signatures 01/21/2022
+renameSigs = paste0("CN",1:21)
+names(renameSigs) = paste0("CN",c(1:12,20:22,14:19))
+colnames(cn_sig_exp)[-1]=renameSigs[colnames(cn_sig_exp)[-1]]
+
+# Load clinical data
+clinical <- read.delim(paste0(DATA,clinical_filename,sep=""), header=T, stringsAsFactors = FALSE);
+print(paste0("Number of samples in clinical dataset: " , nrow(clinical), sep=""))
+
+# Remove duplicates
+clinical <- clinical[!duplicated(clinical$bcr_patient_barcode), ];
+print(paste0("Number of samples in clinical dataset after removing duplicates: " , nrow(clinical), sep=""))
+
+# Remove redacted samples
+clinical <- clinical[(clinical$Redaction!="Redacted"),] # remove samples redacted from the final set of samples 
+print(paste0("Number of samples in clinical dataset after removing redacted samples: " , nrow(clinical), sep=""))
+
+# Merge copy number data and clinical dataset
+df <- merge(clinical,cn_sig_exp, by ="bcr_patient_barcode");
+print(paste0("Number of samples in merged dataset: " , nrow(df), sep=""))
+
+# Keep only columns to use:
+columns_to_use = names(df)[which(grepl( "bcr_patient_barcode|gender|age_at_initial_pathologic_diagnosis|DSS|DSS.time|type|CN|Redaction" , names( df ) ))]
+df = df[,columns_to_use ];
+
+# Replace non-zero values of copy number signatures with 1  --> binary annotation of cn sigs
+cns_columns = names(df)[which(grepl( "CN" , names( df ) ))]
+df[,cns_columns][(df[,cns_columns])>0] = 1
+```
+```{r}
+# Tissue-specific Diease Free Surivial:
+tissue_types = unique(df$type)
+
+# Lists
+p <- list(); q <- list();  sigs <- list(); tissue <- list(); alive <- list(); dead <- list(); present <- list(); absent <- list(); median_present <- list(); median_absent <- list();diff_median <- list();
+
+index = 1
+
+for(i in 1:length(tissue_types)){
+  
+  # susbet to samples from a specific tissue type with DSS annotation
+  data=df;  
+  keep_pats = which(( data$DSS != "#N/A" & data$DSS.time !=  "#N/A" & data$type == tissue_types[i]));
+  data = data[keep_pats,]
+
+  cns_columns = names(data)[which(grepl( "CN" , names( data ) ))]
+  data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+  surv_object <- Surv( as.numeric(data$DSS.time), event = data$status);
+
+  for(j in 1:length(cns_columns)){
+    
+    data$cns_stat <-  as.numeric(unlist(data[,cns_columns[j]]));
+    
+    # donot conduct survival analysis for a specific copy number if it has less than 10 samples with or without cn attributions for a given tissue type
+    if(sum(data$cns_stat==1) < 10 | sum(data$cns_stat==0) < 10){next;}
+    
+    fit1 <- survfit(surv_object ~ cns_stat, data = data);
+    pvalue = as.numeric(surv_pvalue(fit1, data = data , method = "survdiff")$pval);
+
+   p[[index]] <- pvalue
+   tissue[[index]] <- tissue_types[i]
+   sigs[[index]] <- cns_columns[j]
+   alive[[index]] <- sum(data$status == FALSE)
+   dead[[index]] <- sum(data$status == TRUE)
+   present[[index]] <- sum(data$cns_stat == 1)
+   absent[[index]] <- sum(data$cns_stat == 0)
+   median_absent[[index]] <- summary(fit1)$table[13]
+   median_present[[index]] <- summary(fit1)$table[14]
+   
+   # Difference in median survival if available
+   if(!is.na(median_absent[[index]]) && !is.na(median_present[[index]])){
+     diff_median[[index]] <- as.numeric(median_present[[index]]) - as.numeric(median_absent[[index]])
+   }else{
+     diff_median[[index]] <- NA
+   }
+   
+   index = index +1
+  }
+}
+
+q = p.adjust(unlist(p), "fdr")
+final = (cbind(unlist(tissue),unlist(sigs),unlist(p),unlist(q), unlist(dead), unlist(alive),unlist(present),unlist(absent),unlist(median_present),unlist(median_absent), unlist(diff_median) ))
+table <- data.frame(matrix(unlist(final), nrow=nrow(final), byrow=F),stringsAsFactors=FALSE)
+colnames(table) <- c("Tissue","Signature","p","q","Dead","Alive","Present","Absent","Median_Surv_Attributed","Median_Surv_Unattributed","Diff_Median_Survival")
+table[,c(-1,-2)] <- sapply(table[,c(-1,-2)], as.numeric)
+table = table[(table$q < 0.1),]
+write.table(table, paste0(RESULTS,"tables/tissue.specific.logrank.dss.cn.binary.qthres.0.1.txt",sep=""),sep="\t",quote = FALSE, row.names = FALSE)
+```
+```{r}
+# Plot only the statistically significant survival plots
+table=read.delim(paste0(RESULTS,"tables/tissue.specific.logrank.dss.cn.binary.qthres.0.1.txt",sep=""),sep="\t")
+tissues = table$Tissue
+graphs <- list()
+index = 1
+
+for(i in 1:length(tissues)){
+  
+  print(tissues[i])
+  
+  data=df;  
+  keep_pats = which(( data$DSS != "#N/A" & data$DSS.time !=  "#N/A" & data$type == tissues[i]));
+  data = data[keep_pats,]
+
+  data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+  surv_object <- Surv( as.numeric(data$DSS.time), event = data$status);
+
+ 
+  if(nrow(data) != 0){
+  
+    data$cns <-  as.numeric(unlist(data[,(table$Signature[i])]));
+    fit1 <- survfit(surv_object ~ cns, data = data);
+  
+
+      graphs[[index]] <- ggsurvplot(
+            fit1, 
+            data = data, 
+            size = 0.5,                  # change line size
+            palette = c("darkblue", "orange"),  # custom color palettes
+            conf.int = F,                # Add confidence interval
+            pval = paste0(" q = ", format.pval(as.numeric(table$q[i]),digits = 2),sep=""),# Add q-value
+            risk.table = TRUE,           # Add risk table
+            risk.table.col = "black",   # Risk table color by groups
+            risk.table.title="",
+            legend.title="",
+            legend.labs=c(paste(table$Signature[i],"sig. unattributed", sep=" " ), paste(table$Signature[i],"sig. attributed", sep=" " )),
+            risk.table.height = 0.26, 
+            risk.table.fontsize = 3, # Useful to change when you have multiple groups
+            risk.table.y.text = FALSE,
+            title= paste0(table$Signature[i], " ", tissues[i],sep="")
+      )
+  
+    index = index+1
+  }
+}
+res <- arrange_ggsurvplots(graphs, ncol = 4, nrow = 3)
+ggsave(res,filename=paste(RESULTS,"figures/tissue.specific.logrank.dss.cn.binary.qthres.0.1.png",sep=""),height = 15, width = 18, dpi=1000)
+ggsave(res,filename=paste(RESULTS,"figures/tissue.specific.logrank.dss.cn.binary.qthres.0.1.pdf",sep=""),height = 15, width = 18, dpi=1000)
+```
+
+
+```
+
+# Combining cns signatures into major copy number event categories
+
+```
+
+
+
+
+```{r}
+# Load copy number data:
+cn_sig_exp <- read.delim(paste0(DATA,copynumber_signature_exposures_filename,sep=""), header=T, stringsAsFactors = FALSE);
+names(cn_sig_exp)[names(cn_sig_exp) == "X"] <- "bcr_patient_barcode"
+cn_sig_exp["bcr_patient_barcode"] <- substr(cn_sig_exp$"bcr_patient_barcode",1,12) # getting rid of the weird -b, -c extensions in sample names #9,699  
+cn_sig_exp <- subset (cn_sig_exp, select = -CN13) # remove CN13 with all zeros (recommended by Chris)
+print(paste0("Number of samples in copy number dataset: " , nrow(cn_sig_exp), sep=""))
+
+# Updates -- rename signatures 01/21/2022
+renameSigs = paste0("CN",1:21)
+names(renameSigs) = paste0("CN",c(1:12,20:22,14:19))
+colnames(cn_sig_exp)[-1]=renameSigs[colnames(cn_sig_exp)[-1]]
+
+
+# Load clinical data
+clinical <- read.delim(paste0(DATA,clinical_filename,sep=""), header=T, stringsAsFactors = FALSE);
+print(paste0("Number of samples in clinical dataset: " , nrow(clinical), sep=""))
+
+# Remove duplicates
+clinical <- clinical[!duplicated(clinical$bcr_patient_barcode), ];
+print(paste0("Number of samples in clinical dataset after removing duplicates: " , nrow(clinical), sep=""))
+
+# Remove redacted samples
+clinical <- clinical[(clinical$Redaction!="Redacted"),] # remove samples redacted from the final set of samples 
+print(paste0("Number of samples in clinical dataset after removing redacted samples: " , nrow(clinical), sep=""))
+
+# Merge copy number data and clinical dataset
+df <- merge(clinical,cn_sig_exp, by ="bcr_patient_barcode");
+print(paste0("Number of samples in merged dataset: " , nrow(df), sep=""))
+
+# Keep only columns to use:
+columns_to_use = names(df)[which(grepl( "bcr_patient_barcode|gender|age_at_initial_pathologic_diagnosis|DSS|DSS.time|type|CN|Redaction" , names( df ) ))]
+df = df[,columns_to_use ];
+
+# Replace non-zero values of copy number signatures with 1  --> binary annotation of cns sigs
+df['Amplicon'] = df$CN4+df$CN5+df$CN6+df$CN7+df$CN8
+cns_columns = names(df)[which(grepl( "Amplicon" , names( df ) ))]
+df[,cns_columns][(df[,cns_columns])>0] = 1
+```
+```{r}
+
+data=df;  
+keep_pats = which(( data$DSS != "#N/A" & data$DSS.time !=  "#N/A"));
+data = data[keep_pats,]
+
+cns_columns = names(data)[which(grepl( "Amplicon" , names( data ) ))]
+data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+surv_object <- Surv( as.numeric(data$DSS.time), event = data$status);
+
+
+ for(cns in cns_columns){
+   
+  data$cns_stat <-  as.numeric(unlist(data[,cns]));
+  fit1 <- survfit(surv_object ~ cns_stat, data = data);
+  pvalue = as.numeric(surv_pvalue(fit1, data = data , method = "survdiff")$pval);
+  
+
+    graph <- ggsurvplot(
+          fit1, 
+          data = data, 
+          size = 0.5,                  # change line size
+          palette =c("darkblue", "orange"),  # custom color palettes
+          conf.int = F,                # Add confidence interval
+          pval = paste0(" p = ", format.pval(as.numeric(pvalue),digits = 2),sep=""),# Add q-value
+          risk.table = TRUE,           # Add risk table
+          risk.table.col = "black",   # Risk table color by groups
+          risk.table.title="",
+          legend.title="",
+          legend.labs=c(paste(cns,"sig. unattributed", sep=" " ), paste(cns,"sig. attributed", sep=" " )),
+          risk.table.height = 0.25, 
+          risk.table.fontsize = 3, # Useful to change when you have multiple groups
+          risk.table.y.text = FALSE,
+          title= cns
+    )
+    ggexport(filename=paste(RESULTS,"figures/",cns,".logrank.dss.cns.binary.pdf",sep=""),plot = graph, device = "pdf",height=5.5, width=5.5, dpi=300,newpage = FALSE )
+}
+
+```
+
+
+
+
+```
+
+# HELPER FUNCTIONS
+
+```
+
+```{r}
+# COXPH MODEL
+#
+#  This function allows to determine the coxph hazard ratio for the copy number signature and disease free survival status
+#  @param df --> name of the dataframe
+#  @param tissue_column_name --> name of the column with the tissue labels
+#  @param outdir --> path to the output directory
+#  @return table
+run.coxph <- function(df,tissue_column_name, outdir){
+  
+  data = df;
+  keep_pats = which(( data$DSS !=  "#N/A" & data$DSS.time !=  "#N/A"));
+  data = data[keep_pats,]
+
+  # Get cn names that contain atleast 1 sample with a binary status of 1
+  cns_columns = names(data)[which(grepl( "CN" , names( data ) ))]
+  cns_names = names(data[,c(cns_columns)])[which(colSums(data[,cns_columns])> 0)]
+   
+  combine_all_cns <- paste(cns_names, collapse="+")
+  data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+  surv_object <- Surv( as.numeric(data$DSS.time), event = data$status);
+  res.cox <- coxph(as.formula(paste("surv_object ~ " , tissue_column_name," +",combine_all_cns,sep = ""))  , data = data)
+
+  names = rownames(summary(res.cox)$coefficients)
+  p = as.numeric(summary(res.cox)$coefficients[,5])
+  hr = log(as.numeric(summary(res.cox)$coefficients[,2]))
+  l95 = log(as.numeric(summary(res.cox)$conf.int[,3]))
+  u95 = log(as.numeric(summary(res.cox)$conf.int[,4]))
+
+  q = p.adjust(unlist(p), "fdr") # fdr corrected p-values
+
+  final = (cbind(unlist(names),unlist(hr),unlist(l95),unlist(u95),unlist(p),unlist(q)))
+  table <- data.frame(matrix(unlist(final), nrow=nrow(final), byrow=F),stringsAsFactors=FALSE)
+  colnames(table) <- c("Name","HR","L95","U95","p","q")
+  table[,c(-1)] <- sapply(table[,c(-1)], as.numeric)
+  table$Name <- gsub("type", "", table$Name)
+  table$q_label <- ifelse(table$q <= 0.001, "***",ifelse(((table$q <= 0.01) & (table$q > 0.001)),"**",ifelse(((table$q <= 0.05) & (table$q > 0.01))  , "*","")))
+  write.table(table, paste0(outdir,"tables/coxph.dss.cn.binary.txt",sep="" ),sep="\t",quote = FALSE, row.names = FALSE)
+  return(table)
+}
+```
+```{r}
+# Plot coxph for cns
+plot.coxph <- function(table,skip,type, outdir,ylabel="NA", text_space=0.05,xlimit=2,xlimit_break=1){
+  if(type == "CN"){table = table[grep('CN', table$Name),]}
+  else{table = table[-grep("CN", table$Name),]}
+  
+  if(!is.na(skip)){table = table[-grep(skip,table$Name),]}
+ g = table %>%  mutate(Name = fct_reorder(Name, HR)) %>% ggplot(aes(y=Name, x=HR,colour = "black")) + geom_text(aes( x = max(as.numeric(U95)) + text_space, y=Name, label=q_label), color="black", size=1.5 , angle=0 ) +  geom_vline(aes(xintercept = 0), size = .25, color="black") + geom_errorbarh(aes(xmax = as.numeric(U95), xmin = as.numeric(L95)), size = .2, height = .2, color = "black")  + geom_point(size = 1,shape=19, color = "black") + theme_classic()   +theme(axis.text.y = element_text(color = "black"), axis.text.x = element_text(color = "black")) +   xlab("log(Hazard Ratio)")  + ylab(ylabel) + coord_capped_cart(bottom='both', left='both') +  scale_x_continuous(breaks=seq(-xlimit,xlimit,by=xlimit_break))
+ggsave(g,filename=paste(outdir,"figures/all.coxph.dss.", tolower(type), ".binary.pdf",sep=""),width=3,height=5, dpi=300)
+}
+
+```
+
+
+
+
+
+```{r}
+
+run.aft <- function(df,tissue_column_name, outdir){
+  
+  data = df;
+  keep_pats = which(( data$DSS !=  "#N/A" & data$DSS.time !=  "#N/A"));
+  data = data[keep_pats,]
+
+  # Get cns names that contain atleast 1 sample with a binary status of 1
+  cns_columns = names(data)[which(grepl( "CN" , names( data ) ))]
+  cns_names = names(data[,c(cns_columns)])[which(colSums(data[,cns_columns])> 0)]
+   
+  combine_all_cns <- paste(cns_names, collapse="+")
+  data$status <- grepl("1", data$DSS, ignore.case = TRUE)
+  surv_object <- Surv( ((as.numeric(data$DSS.time)+1)), event = data$status); # add pseudo count 
+  res.aft <-flexsurvreg(formula = as.formula(paste("surv_object ~ ", "type",  " +", combine_all_cns, sep = "")), data = data, dist = "weibull")
+  
+  names = rownames(res.aft$res.t)
+  df_coef = log(exp(res.aft$res.t[,1]))
+  l95 = log(exp(res.aft$res.t[,2]))
+  u95 = log(exp(res.aft$res.t[,3]))
+  p = 2*pnorm(-abs(res.aft$res.t[,1]/res.aft$res.t[,4])) # wald test
+
+
+  q = p.adjust(unlist(p), "fdr") # fdr corrected p-values
+
+  final = (cbind(unlist(names),unlist(df_coef),unlist(l95),unlist(u95),unlist(p),unlist(q)))
+  table <- data.frame(matrix(unlist(final), nrow=nrow(final), byrow=F),stringsAsFactors=FALSE)
+  colnames(table) <- c("Name","DF","L95","U95","p","q")
+  table[,c(-1)] <- sapply(table[,c(-1)], as.numeric)
+  table$Name <- gsub("type", "", table$Name)
+  table$q_label <- ifelse(table$q <= 0.001, "***",ifelse(((table$q <= 0.01) & (table$q > 0.001)),"**",ifelse(((table$q <= 0.05) & (table$q > 0.01))  , "*","")))
+  table = table[3:nrow(table),] # get rid of the scale and shape parameters
+  write.table(table, paste0(outdir,"tables/aft.dss.cns.binary.txt",sep=""),sep="\t",quote = FALSE)
+  return(table)
+}
+```
+```{r}
+# Plot aft
+plot.aft <- function(table,skip,type,outdir,ylabel="Copy Number Signatures",text_space=0.05,xlimit=2,xlimit_break=1 ){
+  if(type == "CN"){table = table[grep('CN', table$Name),]}
+  else{table = table[-grep("CN", table$Name),]}
+  
+  if(!is.na(skip)){table = table[-grep(skip,table$Name),]}
+g = table %>%  mutate(Name = fct_reorder(Name, DF)) %>% ggplot(aes(y=Name, x=DF,colour = "black")) + geom_text(aes( x = max(as.numeric(U95)) + text_space, y=Name, label=q_label), color="black", size=1.5 , angle=0 ) +  geom_vline(aes(xintercept = 0), size = .25, color="black")  + scale_x_continuous(breaks=seq(-xlimit,xlimit,by=xlimit_break))+  geom_errorbarh(aes(xmax = as.numeric(U95), xmin = as.numeric(L95)), size = .2, height = .2, color = "black") +
+ geom_point(size = 1,shape=19, color = "black") + theme_classic()   +theme(axis.text.y = element_text(color = "black"), axis.text.x = element_text(color = "black")) +   xlab("log(Deceleration Factor)")  + ylab(ylabel) + coord_capped_cart(bottom='both', left='both')
+ggsave(g,filename=paste(outdir,"figures/all.aft.dss.", tolower(type), ".binary.pdf",sep=""),width=3,height=5, dpi=300)
+}
+
+```
