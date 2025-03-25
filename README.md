@@ -20,6 +20,7 @@ The rendered output is available as `TCGA_Microbiome_Analysis.md`, which include
 - **`TCGA_Microbiome_Analysis.Rmd`**: The source R Markdown file containing the full analysis pipeline.
 - **`TCGA_Microbiome_Analysis.md`**: The knitted Markdown file with rendered results, viewable directly on GitHub.
 - **`TCGA_Microbiome_Analysis_files/`**: Folder containing plot images (e.g., `.png` files) referenced in the `.md` file.
+- - **`Input_data/`**: Folder contains all the original data used for the analysis
 
 ## Viewing the Analysis
 
