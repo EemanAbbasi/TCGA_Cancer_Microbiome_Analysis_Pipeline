@@ -21,8 +21,7 @@ The pipeline performs the following steps:
   - `carveme` (for metabolic model reconstruction).
   - `smetana` (for metabolic interaction analysis).
   - `requests` (for downloading genomes from NCBI).
-- **GitHub Actions**: Workflow runs on `ubuntu-latest`.
-- **Input Data**: An OTU table (e.g., `data/otu_table.csv`) with species abundance across samples.
+- **Input Data**: An OTU table (e.g., `input_data/otu_table.csv`) with species abundance across samples.
 
 ## Setup
 
