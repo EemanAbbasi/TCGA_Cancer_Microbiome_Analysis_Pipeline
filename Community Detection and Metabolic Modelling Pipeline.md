@@ -25,5 +25,10 @@ The pipeline performs the following steps:
 
 ## Setup
 
-1. Download Genomes from NCBI database
+1. Download Genomes from NCBI database using the Carme Package - Rather than providing the genome data yourself, you can also provide an NCBI RefSeq accession code. This will automatically download the sequence and build the model:
+
+carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml
+2. Perform gapfilling of the model
+   gapfill model.xml -m M9 -o new_model.xml
+3. S
    
