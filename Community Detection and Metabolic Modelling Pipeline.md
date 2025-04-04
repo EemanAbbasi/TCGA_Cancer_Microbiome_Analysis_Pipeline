@@ -26,18 +26,25 @@ The pipeline performs the following steps:
 
 ## Setup and Usage
 
-1. **Download Genomes from NCBI**  
+1. **Carve a metaboluc model**  
    Instead of manually providing genome data, use `CarveMe` to fetch sequences from NCBI RefSeq by specifying an accession code. For example:
-   'carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml'
+   ```bash
+   carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml
+   carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml
+   ```
     This command downloads the *Escherichia coli* K-12 MG1655 genome and builds a metabolic model.
 
-3. **Carve the metabolic model and/or gapfill with the relevant growth media**  
+3. **Gapfill with the relevant growth media**  
 Refine the reconstructed model by filling metabolic gaps using a specified medium (e.g., M9):
-'carvme gapfill ecoli_k12_mg1655.xml -m M9 -o ecoli_k12_mg1655_gapfilled.xml'
+```bash
+carvme gapfill ecoli_k12_mg1655.xml -m M9 -o ecoli_k12_mg1655_gapfilled.xml
+```
 
 3. **Analyze Metabolic Interactions**  
 Use `SMETANA` to compute interaction scores for communities. Provide the gapfilled models and a TSV file listing community members (e.g., `communities.tsv`):
-'smetana *.xml -c communities.tsv'
+```bash
+smetana_main.py *.xml 
+```
 This leverages code from `smetana_main.py` in the metabolic interaction folder.
 
 ## References
