@@ -31,7 +31,7 @@ The pipeline performs the following steps:
    'carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml'
     This command downloads the *Escherichia coli* K-12 MG1655 genome and builds a metabolic model.
 
-3. **Gapfill the Model**  
+3. **Carve the metabolic model and/or gapfill the Model with the relevant media**  
 Refine the reconstructed model by filling metabolic gaps using a specified medium (e.g., M9):
 'carvme gapfill ecoli_k12_mg1655.xml -m M9 -o ecoli_k12_mg1655_gapfilled.xml'
 
@@ -44,4 +44,3 @@ This leverages code from `smetana_main.py` in the metabolic interaction folder.
 
 1. Machado, D., Andrejev, S., Tramontano, M., & Patil, K. R. (2018). Fast automated reconstruction of genome-scale metabolic models for microbial species and communities. *Nucleic Acids Research*, 46(15), 7542–7553. https://doi.org/10.1093/nar/gky537 (`CarveMe`)  
 2. Zelezniak, A., Andrejev, S., Ponomarova, O., Mende, D. R., Bork, P., & Patil, K. R. (2015). Metabolic dependencies drive species co-occurrence in diverse microbial communities. *Proceedings of the National Academy of Sciences*, 112(20), 6449–6454. https://doi.org/10.1073/pnas.1421834112 (`SMETANA`)  
-3. Clauset, A., Newman, M. E. J., & Moore, C. (2004). Finding community structure in very large networks. *Physical Review E*, 70(6), 066111. https://doi.org/10.1103/PhysRevE.70.066111  
