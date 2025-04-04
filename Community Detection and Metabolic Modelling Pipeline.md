@@ -1,14 +1,11 @@
 # Mutualism and Competition Analysis Pipeline
 
-This repository contains a GitHub Actions pipeline to analyze mutualistic and competitive interactions between microbial species based on OTU (Operational Taxonomic Unit) data. The methodology is represented by the sections *Determining co-occurring communities* and *Determining metabolic interactions* in the paper. The pipeline filters OTU tables, constructs co-occurrence networks, detects communities, reconstructs metabolic models using `CarveMe` [1], and evaluates metabolic interactions using `SMETANA` [2].
+This repository contains a GitHub Actions pipeline to analyze mutualistic and competitive interactions between microbial species based on OTU (Operational Taxonomic Unit) data. The methodology is represented by the sections *Determining co-occurring communities* and *Determining metabolic interactions* in the paper. The pipeline reconstructs metabolic models using `CarveMe` [1], and evaluates metabolic interactions using `SMETANA` [2].
 
 ## Overview
 
 The pipeline performs the following steps:
 
-- **Filter OTU Table**: Retains species present in >50% of samples to ensure robust representation.
-- **Correlation Analysis**: Computes Spearman correlations (|corr| > 0.6, adjusted p < 0.01) to construct a co-occurrence network.
-- **Community Detection**: Applies the fast greedy algorithm (Clauset et al., 2004) to identify sub-communities with >10 species.
 - **Genome Download**: Retrieves RefSeq genomes from NCBI for species in detected communities.
 - **Metabolic Model Reconstruction**: Constructs genome-scale metabolic models using `CarveMe` with default, M9, and LB media settings.
 - **Metabolic Interactions**: Calculates competition and mutualism scores using `SMETANA`.
