@@ -33,7 +33,7 @@ The pipeline performs the following steps:
 3. **Gapfill with the relevant growth media**  
 Refine the reconstructed model by filling metabolic gaps using a specified medium (e.g., M9):
 ```bash
-carvme gapfill ecoli_k12_mg1655.xml -m M9 -o ecoli_k12_mg1655_gapfilled.xml
+carve gapfill ecoli_k12_mg1655.xml -m M9 -o ecoli_k12_mg1655_gapfilled.xml
 ```
 
 3. **Analyze Metabolic Interactions**  
