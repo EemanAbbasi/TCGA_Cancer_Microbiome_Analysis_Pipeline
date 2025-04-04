@@ -30,7 +30,6 @@ The pipeline performs the following steps:
    Instead of manually providing genome data, use `CarveMe` to fetch sequences from NCBI RefSeq by specifying an accession code. For example:
    ```bash
    carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml
-   carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml
    ```
     This command downloads the *Escherichia coli* K-12 MG1655 genome and builds a metabolic model.
 
