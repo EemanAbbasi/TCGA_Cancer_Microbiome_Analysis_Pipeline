@@ -31,7 +31,7 @@ The pipeline performs the following steps:
    'carve --refseq GCF_000005845.2 -o ecoli_k12_mg1655.xml'
     This command downloads the *Escherichia coli* K-12 MG1655 genome and builds a metabolic model.
 
-3. **Carve the metabolic model and/or gapfill the Model with the relevant media**  
+3. **Carve the metabolic model and/or gapfill with the relevant growth media**  
 Refine the reconstructed model by filling metabolic gaps using a specified medium (e.g., M9):
 'carvme gapfill ecoli_k12_mg1655.xml -m M9 -o ecoli_k12_mg1655_gapfilled.xml'
 
